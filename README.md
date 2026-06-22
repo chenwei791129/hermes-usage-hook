@@ -46,6 +46,52 @@ backend serves to authenticated Codex clients:
 | `hooks/plugin_hook.py` | Hermes **plugin hook** (`on_session_end`) — runs in CLI **and** gateway modes. Recommended. |
 | `hooks/gateway/HOOK.yaml` + `hooks/gateway/handler.py` | Hermes **gateway hook** (`agent:end`) — runs in messaging gateway mode only. |
 
+## Hermes hook reference
+
+Hermes has **three independent hook systems**. All three are non-blocking,
+catch their own errors, and never crash the agent.
+
+| System | Defined in | Runs in | Can block / rewrite? |
+| --- | --- | --- | --- |
+| **Gateway hooks** | `~/.hermes/hooks/<name>/` (`HOOK.yaml` + `handler.py`) | Messaging gateway only (Telegram/Discord/Slack/…) — not the CLI | Observe only |
+| **Plugin hooks** | A Python plugin's `ctx.register_hook(...)` | CLI **and** gateway | Some can block / inject |
+| **Shell hooks** | The `hooks:` block in `~/.hermes/config.yaml` (calls an external script) | CLI **and** gateway | Some can block / inject |
+
+### Events
+
+**Gateway events** (`namespace:action` form, loaded by `gateway/hooks.py`)
+
+| Event | Fires when | Notable context |
+| --- | --- | --- |
+| `gateway:startup` | Gateway starts | — |
+| `session:start` / `session:end` / `session:reset` | Messaging session starts / ends / resets | `platform`, `user_id`, `session_key` |
+| `agent:start` | Agent begins handling a message | `platform`, `user_id`, `session_id` |
+| `agent:step` | Each tool-call loop iteration | `iteration`, `tool_names` |
+| `agent:end` | Agent finishes handling a message (closest to "turn end") | `message`, `response` |
+| `command:*` | Any slash command (wildcard) | command args |
+
+**Plugin / Shell hook events** (fired in `agent/conversation_loop.py` and `agent/turn_finalizer.py`)
+
+| Event | Fires when | Notable context |
+| --- | --- | --- |
+| `pre_llm_call` / `post_llm_call` | Before / after each turn | `approx_input_tokens` (pre), `assistant_response` (post) |
+| `on_session_start` / `on_session_end` / `on_session_finalize` / `on_session_reset` | Conversation lifecycle; `on_session_end` fires at the end of every `run_conversation()` (success or interrupt) | `session_id`, `completed`, `interrupted` |
+| `pre_tool_call` / `post_tool_call` / `transform_tool_result` | Around tool execution | `tool_name`, `tool_input` |
+| `transform_llm_output` | Before the response is sent | full output text |
+| `subagent_start` / `subagent_stop`, `pre_gateway_dispatch`, `pre_approval_request` / `post_approval_response` | Subagents, dispatch, approvals | varies |
+
+> Shell hooks support a smaller subset: `pre_tool_call`, `post_tool_call`,
+> `on_session_start`, `on_session_end`, `subagent_stop`.
+
+Only three events can **change behavior** — `pre_tool_call` (block a tool),
+`pre_llm_call` (inject context), and `pre_gateway_dispatch` (skip/rewrite/allow).
+Everything else is a fire-and-forget observer.
+
+**What this project uses:** the plugin hook subscribes to **`on_session_end`**
+(CLI + gateway); the gateway hook subscribes to **`agent:end`** (gateway only).
+Both report usage when a conversation finishes — neither uses `session:end`,
+which only fires when the whole messaging session ends.
+
 ## Quick check (before deploying)
 
 Make sure you can fetch usage with your current Codex login:
