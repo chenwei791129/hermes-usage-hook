@@ -9,6 +9,7 @@ Reuses the notifier in ``plugin_hook`` so both hooks share one code path.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -23,7 +24,8 @@ from plugin_hook import _notify  # noqa: E402
 async def handle(event_type: str, context: dict):
     """Fire-and-forget observer; failures are swallowed so the agent is safe."""
     try:
-        usage = await get_codex_usage()
+        # get_codex_usage is sync; run it off the event loop.
+        usage = await asyncio.to_thread(get_codex_usage)
         await _notify(format_summary(usage))
     except Exception as exc:  # noqa: BLE001 - observer hook must not propagate
         print(f"[codex-usage-hook] skipped: {exc}", file=sys.stderr)

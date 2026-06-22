@@ -69,7 +69,7 @@ def _needs_refresh(auth: dict) -> bool:
     return (datetime.now(timezone.utc) - ts).days >= REFRESH_AFTER_DAYS
 
 
-async def _refresh(auth: dict) -> dict:
+def _refresh(auth: dict) -> dict:
     """Exchange the refresh token for a fresh access token and persist it."""
     tokens = auth.get("tokens", {})
     refresh_token = tokens.get("refresh_token")
@@ -82,8 +82,8 @@ async def _refresh(auth: dict) -> dict:
         "refresh_token": refresh_token,
         "scope": "openid profile email",
     }
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        resp = client.post(
             TOKEN_URL, json=body, headers={"Content-Type": "application/json"}
         )
         resp.raise_for_status()
@@ -100,7 +100,7 @@ async def _refresh(auth: dict) -> dict:
     return auth
 
 
-async def _call_usage(access_token: str, account_id: str | None) -> dict:
+def _call_usage(access_token: str, account_id: str | None) -> dict:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
@@ -108,8 +108,8 @@ async def _call_usage(access_token: str, account_id: str | None) -> dict:
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.get(USAGE_URL, headers=headers)
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        resp = client.get(USAGE_URL, headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -147,8 +147,12 @@ def _normalize(raw: dict) -> dict:
     }
 
 
-async def get_codex_usage() -> dict:
+def get_codex_usage() -> dict:
     """Return normalized Codex usage, refreshing the token when needed.
+
+    Synchronous on purpose: the ``transform_llm_output`` hook consumes the
+    result as a plain string, so the fetch must run inline. Async hooks call
+    this via ``asyncio.to_thread`` to avoid blocking the event loop.
 
     Raises on unrecoverable errors (missing auth.json, network failure, a
     non-auth HTTP error). Callers running inside a hook should wrap this in a
@@ -159,7 +163,7 @@ async def get_codex_usage() -> dict:
     # refresh_token, so skip the refresh path entirely for it.
     can_refresh = bool(auth.get("tokens", {}).get("refresh_token"))
     if can_refresh and _needs_refresh(auth):
-        auth = await _refresh(auth)
+        auth = _refresh(auth)
 
     tokens = auth.get("tokens", {})
     access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
@@ -168,13 +172,13 @@ async def get_codex_usage() -> dict:
     account_id = tokens.get("account_id")
 
     try:
-        raw = await _call_usage(access_token, account_id)
+        raw = _call_usage(access_token, account_id)
     except httpx.HTTPStatusError as exc:
         # A stale token can still slip past the age check; refresh once and retry.
         if exc.response.status_code in (401, 403) and can_refresh:
-            auth = await _refresh(auth)
+            auth = _refresh(auth)
             access_token = auth["tokens"]["access_token"]
-            raw = await _call_usage(access_token, account_id)
+            raw = _call_usage(access_token, account_id)
         else:
             raise
     return _normalize(raw)
@@ -198,12 +202,11 @@ def _handle_sigterm(signum, frame):
 
 
 if __name__ == "__main__":
-    import asyncio
     import signal
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
-        result = asyncio.run(get_codex_usage())
+        result = get_codex_usage()
         print(json.dumps(result, indent=2))
         print(format_summary(result))
     except KeyboardInterrupt:

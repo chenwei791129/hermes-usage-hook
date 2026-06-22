@@ -34,7 +34,8 @@ def register(ctx):
 async def on_session_end(session_id=None, completed=None, **kwargs):
     """Fire-and-forget: never raise, so a failure can't break the agent."""
     try:
-        usage = await get_codex_usage()
+        # get_codex_usage is sync; run it off the event loop.
+        usage = await asyncio.to_thread(get_codex_usage)
         await _notify(format_summary(usage))
     except Exception as exc:  # noqa: BLE001 - observer hook must not propagate
         print(f"[codex-usage-hook] skipped: {exc}", file=sys.stderr)
