@@ -118,48 +118,54 @@ python codex_usage.py
 
 You should see the normalized JSON plus a one-line summary.
 
-## Deploy to Hermes Agent
+## Deploy the footer hook (recommended)
 
-Hermes loads hooks from `~/.hermes/`. Every option needs the shared module:
+Appends the usage to the agent's reply via `transform_llm_output`, so Hermes
+delivers it back to whatever platform the conversation came from (Telegram → that
+chat, Discord → that channel). No bot tokens, no `chat_id`, no per-platform code,
+and no configuration.
 
 ```bash
 git clone git@github.com:<you>/hermes-codex-usage-hook.git
 cd hermes-codex-usage-hook
-mkdir -p ~/.hermes/lib
+
+# Shared module + the footer plugin hook.
+mkdir -p ~/.hermes/lib ~/.hermes/plugins
 cp codex_usage.py ~/.hermes/lib/
-```
-
-Then pick **one** option.
-
-### Option A — Footer on the reply (recommended: routes to the user's platform)
-
-`transform_llm_output` appends the usage to the agent's reply, so Hermes
-delivers it back to whatever platform the conversation came from (Telegram → that
-chat, Discord → that channel). No bot tokens, no `chat_id`, no per-platform code.
-
-```bash
-mkdir -p ~/.hermes/plugins
 cp hooks/footer_hook.py ~/.hermes/plugins/codex_usage_footer.py
 ```
 
 Restart Hermes; it discovers `register(ctx)` and the footer appears under each
-reply. No configuration is required.
+reply.
 
 > **Streaming caveat:** if your deployment streams responses, the reply body is
 > already sent before this hook runs, so the footer may not be applied. If it
-> never appears, use Option C (the `agent:end` gateway hook) instead.
+> never appears, use the `agent:end` gateway hook below instead.
 
-### Option B — Fixed-destination notification, CLI + gateway
+## Deploy a fixed-destination notification (alternative)
+
+Use this instead if you want a *separate* notification sent to one fixed place (a
+desktop notification or a single webhook) regardless of which chat triggered it —
+for example when running the CLI. Both options need the shared module:
+
+```bash
+mkdir -p ~/.hermes/lib
+cp codex_usage.py ~/.hermes/lib/
+```
+
+Then pick **one**.
+
+### Plugin hook — CLI + gateway
 
 `on_session_end` fires at the end of every conversation (CLI and gateway) and
-sends a separate notification to one fixed place (see Configuration).
+sends the notification to the configured destination.
 
 ```bash
 mkdir -p ~/.hermes/plugins
 cp hooks/plugin_hook.py ~/.hermes/plugins/codex_usage_hook.py
 ```
 
-### Option C — Fixed-destination notification, gateway only
+### Gateway hook — gateway only
 
 Gateway hooks live in `~/.hermes/hooks/<name>/` as `HOOK.yaml` + `handler.py`.
 
@@ -174,9 +180,9 @@ notifies.
 
 ## Configuration
 
-Option A (the footer) needs no configuration — restart and it works.
+The footer hook needs no configuration — restart and it works.
 
-Options B and C select where the notification goes with the
+The fixed-destination notification selects where it goes with the
 `CODEX_USAGE_NOTIFIER` environment variable:
 
 | Value | Behavior |
