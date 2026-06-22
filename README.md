@@ -43,8 +43,18 @@ backend serves to authenticated Codex clients:
 | File | Purpose |
 | --- | --- |
 | `codex_usage.py` | Standalone module: read `auth.json`, refresh token, fetch and normalize usage. |
-| `hooks/plugin_hook.py` | Hermes **plugin hook** (`on_session_end`) — runs in CLI **and** gateway modes. Recommended. |
-| `hooks/gateway/HOOK.yaml` + `hooks/gateway/handler.py` | Hermes **gateway hook** (`agent:end`) — runs in messaging gateway mode only. |
+| `hooks/footer_hook.py` | Hermes **plugin hook** (`transform_llm_output`) — appends usage to each reply, **auto-routed back to the user's current platform** (Telegram → that chat, Discord → that channel). **Recommended.** |
+| `hooks/plugin_hook.py` | Hermes **plugin hook** (`on_session_end`) — sends a separate notification to a **fixed** destination (desktop / webhook). Runs in CLI **and** gateway. |
+| `hooks/gateway/HOOK.yaml` + `hooks/gateway/handler.py` | Hermes **gateway hook** (`agent:end`) — same fixed-destination notifier, gateway mode only. |
+
+Two delivery styles, pick by what you want:
+
+- **Route to the user's current platform** → use `footer_hook.py`. The usage
+  rides on the agent's reply, so Hermes delivers it wherever the user is, with no
+  bot tokens and no per-platform code. (Caveat: streaming deployments — see below.)
+- **Notify a fixed destination** (a desktop notification or one webhook,
+  regardless of which chat triggered it) → use `plugin_hook.py` or the gateway
+  hook, configured via `CODEX_USAGE_NOTIFIER`.
 
 ## Hermes hook reference
 
@@ -77,7 +87,7 @@ catch their own errors, and never crash the agent.
 | `pre_llm_call` / `post_llm_call` | Before / after each turn | `approx_input_tokens` (pre), `assistant_response` (post) |
 | `on_session_start` / `on_session_end` / `on_session_finalize` / `on_session_reset` | Conversation lifecycle; `on_session_end` fires at the end of every `run_conversation()` (success or interrupt) | `session_id`, `completed`, `interrupted` |
 | `pre_tool_call` / `post_tool_call` / `transform_tool_result` | Around tool execution | `tool_name`, `tool_input` |
-| `transform_llm_output` | Before the response is sent | full output text |
+| `transform_llm_output` | Before the response is sent; return a non-empty string to replace it (rides Hermes' delivery path → auto-routes to the user's platform) | `response_text`, `session_id`, `model`, `platform` |
 | `subagent_start` / `subagent_stop`, `pre_gateway_dispatch`, `pre_approval_request` / `post_approval_response` | Subagents, dispatch, approvals | varies |
 
 > Shell hooks support a smaller subset: `pre_tool_call`, `post_tool_call`,
@@ -87,10 +97,13 @@ Only three events can **change behavior** — `pre_tool_call` (block a tool),
 `pre_llm_call` (inject context), and `pre_gateway_dispatch` (skip/rewrite/allow).
 Everything else is a fire-and-forget observer.
 
-**What this project uses:** the plugin hook subscribes to **`on_session_end`**
-(CLI + gateway); the gateway hook subscribes to **`agent:end`** (gateway only).
-Both report usage when a conversation finishes — neither uses `session:end`,
-which only fires when the whole messaging session ends.
+**What this project uses:** `footer_hook.py` subscribes to
+**`transform_llm_output`** (appends the usage to the reply, so it auto-routes to
+the user's platform — the recommended path). The fixed-destination variants use
+**`on_session_end`** (plugin, CLI + gateway) and **`agent:end`** (gateway only).
+None use `session:end`, which only fires when the whole messaging session ends,
+and to *actively* push at `agent:end` you would need the `chat_id` from its
+context plus each platform's API token — which is exactly what the footer avoids.
 
 ## Quick check (before deploying)
 
@@ -107,36 +120,51 @@ You should see the normalized JSON plus a one-line summary.
 
 ## Deploy to Hermes Agent
 
-Hermes loads hooks from `~/.hermes/`. Pick **one** of the two options below.
-
-### Option A — Plugin hook (recommended: CLI + gateway)
-
-The `on_session_end` hook fires at the end of every conversation in both CLI and
-gateway modes.
+Hermes loads hooks from `~/.hermes/`. Every option needs the shared module:
 
 ```bash
 git clone git@github.com:<you>/hermes-codex-usage-hook.git
 cd hermes-codex-usage-hook
-
-# Put the shared module where both hook styles can import it.
 mkdir -p ~/.hermes/lib
 cp codex_usage.py ~/.hermes/lib/
+```
 
-# Install the plugin hook into your Hermes plugins directory.
+Then pick **one** option.
+
+### Option A — Footer on the reply (recommended: routes to the user's platform)
+
+`transform_llm_output` appends the usage to the agent's reply, so Hermes
+delivers it back to whatever platform the conversation came from (Telegram → that
+chat, Discord → that channel). No bot tokens, no `chat_id`, no per-platform code.
+
+```bash
+mkdir -p ~/.hermes/plugins
+cp hooks/footer_hook.py ~/.hermes/plugins/codex_usage_footer.py
+```
+
+Restart Hermes; it discovers `register(ctx)` and the footer appears under each
+reply. No configuration is required.
+
+> **Streaming caveat:** if your deployment streams responses, the reply body is
+> already sent before this hook runs, so the footer may not be applied. If it
+> never appears, use Option C (the `agent:end` gateway hook) instead.
+
+### Option B — Fixed-destination notification, CLI + gateway
+
+`on_session_end` fires at the end of every conversation (CLI and gateway) and
+sends a separate notification to one fixed place (see Configuration).
+
+```bash
 mkdir -p ~/.hermes/plugins
 cp hooks/plugin_hook.py ~/.hermes/plugins/codex_usage_hook.py
 ```
 
-Hermes discovers the `register(ctx)` entry point on startup and registers the
-`on_session_end` callback. Restart Hermes to load it.
-
-### Option B — Gateway hook (messaging gateway only)
+### Option C — Fixed-destination notification, gateway only
 
 Gateway hooks live in `~/.hermes/hooks/<name>/` as `HOOK.yaml` + `handler.py`.
 
 ```bash
-mkdir -p ~/.hermes/lib ~/.hermes/hooks/codex-usage-notify
-cp codex_usage.py ~/.hermes/lib/
+mkdir -p ~/.hermes/hooks/codex-usage-notify
 cp hooks/plugin_hook.py ~/.hermes/lib/        # handler.py imports _notify from it
 cp hooks/gateway/HOOK.yaml hooks/gateway/handler.py ~/.hermes/hooks/codex-usage-notify/
 ```
@@ -146,7 +174,10 @@ notifies.
 
 ## Configuration
 
-The notifier is selected with the `CODEX_USAGE_NOTIFIER` environment variable:
+Option A (the footer) needs no configuration — restart and it works.
+
+Options B and C select where the notification goes with the
+`CODEX_USAGE_NOTIFIER` environment variable:
 
 | Value | Behavior |
 | --- | --- |
