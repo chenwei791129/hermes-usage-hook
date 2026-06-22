@@ -1,0 +1,4 @@
+name: codex-usage-notify
+description: Report Codex 5h rate-limit usage when the agent finishes a turn
+events:
+  - agent:end
