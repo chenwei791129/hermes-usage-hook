@@ -141,6 +141,7 @@ def _normalize(raw: dict) -> dict:
         }
     credits = raw.get("credits") or {}
     return {
+        "provider": "Codex",
         "plan_type": raw.get("plan_type"),
         "windows": windows,
         "credits_balance": credits.get("balance"),
@@ -184,25 +185,16 @@ def get_codex_usage() -> dict:
     return _normalize(raw)
 
 
-def format_summary(usage: dict) -> str:
-    """Build a one-line human-readable summary, focused on the 5h window."""
-    window = usage.get("windows", {}).get("5h", {})
-    if not window:
-        return "Codex usage: 5h window unavailable"
-    return (
-        f"Codex 5h | used {window.get('used_percent')}%, "
-        f"left {window.get('remaining_percent')}% "
-        f"(resets in {window.get('reset_in_min')} min) | "
-        f"plan {usage.get('plan_type')}"
-    )
-
-
 def _handle_sigterm(signum, frame):
     raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":
     import signal
+
+    # Deferred import avoids a circular import: usage imports this module at
+    # top level, while this module only needs format_summary when run directly.
+    from usage import format_summary
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     try:

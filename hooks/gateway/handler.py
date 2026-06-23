@@ -17,8 +17,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.expanduser("~/.hermes/lib"))
 
-from codex_usage import format_summary, get_codex_usage  # noqa: E402
+from codex_usage import get_codex_usage  # noqa: E402
 from plugin_hook import _notify  # noqa: E402
+from usage import format_summary  # noqa: E402
 
 
 async def handle(event_type: str, context: dict):

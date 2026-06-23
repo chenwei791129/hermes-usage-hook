@@ -1,4 +1,7 @@
-"""Hermes plugin hook: append Codex 5h usage as a footer to each reply.
+"""Hermes plugin hook: append the current provider's 5h usage as a reply footer.
+
+Detects the provider from the reply's ``model`` (Codex or MiniMax) and appends
+that provider's usage; an unrecognized model leaves the reply unchanged.
 
 Registers ``transform_llm_output``, which replaces the final response text just
 before Hermes delivers it. Because the footer rides on Hermes' normal delivery
@@ -25,7 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.expanduser("~/.hermes/lib"))
 
-from codex_usage import format_summary, get_codex_usage  # noqa: E402
+from usage import format_summary, get_usage_for_model  # noqa: E402
 
 
 def register(ctx):
@@ -34,11 +37,19 @@ def register(ctx):
 
 
 def append_usage_footer(response_text: str, **kwargs) -> str | None:
-    """Append the usage footer; return None to leave the response unchanged."""
+    """Append the usage footer; return None to leave the response unchanged.
+
+    Detects the provider from the current reply's ``model`` and fetches that
+    provider's usage. An unrecognized model, or any fetch failure, leaves the
+    reply unchanged (returns None).
+    """
     if not response_text:
         return None
     try:
-        footer = format_summary(get_codex_usage())
+        usage = get_usage_for_model(kwargs.get("model"))
+        if usage is None:
+            return None
+        footer = format_summary(usage)
     except Exception as exc:  # noqa: BLE001 - never break the reply
         print(f"[codex-usage-hook] skipped: {exc}", file=sys.stderr)
         return None
