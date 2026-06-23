@@ -15,8 +15,7 @@ plain string (``isinstance(result, str)``) and keeps the first non-empty string,
 so an async handler returning a coroutine would be silently ignored.
 
 Caveat: in streaming deployments the response body is already sent before this
-hook runs, so the rewrite may not take effect. If the footer never appears, use
-the agent:end gateway hook instead (see README).
+hook runs, so the rewrite may not take effect, and the footer may not appear.
 """
 
 from __future__ import annotations
