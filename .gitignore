@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 .env
+.spectra/
+openspec/.vector-search.db*
