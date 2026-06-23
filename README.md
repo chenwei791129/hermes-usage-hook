@@ -38,12 +38,60 @@ backend serves to authenticated Codex clients:
 > from Codex CLI behavior, not a documented API. OpenAI may change them without
 > notice, so every call is wrapped so a failure never breaks the agent.
 
+## Multi-provider auto-detection (footer hook)
+
+The footer hook serves more than one backend. The `transform_llm_output` context
+carries the `model` that produced the reply, so the hook detects which provider
+to report from that name (case-insensitive) and fetches **only** that provider's
+usage. This keeps the footer honest when you mix backends — a MiniMax reply shows
+MiniMax usage, not Codex.
+
+Detection rules (in `usage.py`):
+
+| Provider | Matches when `model` … | Example models |
+| --- | --- | --- |
+| **Codex** | contains `codex`, or starts with `gpt-`, `o1`, `o3`, or `o4` | `gpt-5-codex`, `o3-mini` |
+| **MiniMax** | contains `minimax` or `abab` | `MiniMax-M2.5`, `abab6.5s-chat` |
+| _none_ | anything else, or no `model` | `claude-opus-4` → reply left unchanged |
+
+When no provider matches, the reply is left unchanged and no usage is fetched.
+Adding a provider is one new module plus one line in the `usage.py` registry.
+
+Footer examples:
+
+```
+Codex 5h | used 42%, left 58% (resets in 137 min) | plan pro
+MiniMax 5h | used 4%, left 96% (resets in 281 min)
+```
+
+(MiniMax has no plan tier, so the `| plan …` segment is omitted.)
+
+> **Scope:** auto-detection applies to the **footer hook** only, because it is
+> the only hook with a `model` in its context. The fixed-destination hooks
+> (`on_session_end`, `agent:end`) have no `model` and continue to report Codex.
+
+### MiniMax API token
+
+The MiniMax fetcher needs an API token for
+`GET https://www.minimax.io/v1/token_plan/remains` (pure API key — no OAuth). It
+is resolved in this order:
+
+1. The `MINIMAX_API_KEY` environment variable (a blank value is treated as unset).
+2. Fallback: a `MINIMAX_API_KEY=<value>` line in `$HERMES_HOME/.env` (defaulting
+   to `~/.hermes/.env` when `HERMES_HOME` is unset). Surrounding quotes are
+   stripped.
+
+If neither yields a token, the MiniMax fetch fails and — like any fetch failure
+— the footer is simply skipped, never breaking the reply.
+
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `codex_usage.py` | Standalone module: read `auth.json`, refresh token, fetch and normalize usage. |
-| `hooks/footer_hook.py` | Hermes **plugin hook** (`transform_llm_output`) — appends usage to each reply, **auto-routed back to the user's current platform** (Telegram → that chat, Discord → that channel). **Recommended.** |
+| `usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the provider-labeled summary (`format_summary`). |
+| `codex_usage.py` | Standalone module: read `auth.json`, refresh token, fetch and normalize Codex usage. |
+| `minimax_usage.py` | Standalone module: resolve the MiniMax API token, fetch and normalize MiniMax (international) `token_plan/remains` usage. |
+| `hooks/footer_hook.py` | Hermes **plugin hook** (`transform_llm_output`) — detects the provider from the reply's `model` and appends that provider's usage to each reply, **auto-routed back to the user's current platform** (Telegram → that chat, Discord → that channel). **Recommended.** |
 | `hooks/plugin_hook.py` | Hermes **plugin hook** (`on_session_end`) — sends a separate notification to a **fixed** destination (desktop / webhook). Runs in CLI **and** gateway. |
 | `hooks/gateway/HOOK.yaml` + `hooks/gateway/handler.py` | Hermes **gateway hook** (`agent:end`) — same fixed-destination notifier, gateway mode only. |
 
@@ -129,9 +177,9 @@ and no configuration.
 git clone git@github.com:<you>/hermes-codex-usage-hook.git
 cd hermes-codex-usage-hook
 
-# Shared module + the footer plugin hook.
+# Shared modules + the footer plugin hook.
 mkdir -p ~/.hermes/lib ~/.hermes/plugins
-cp codex_usage.py ~/.hermes/lib/
+cp usage.py codex_usage.py minimax_usage.py ~/.hermes/lib/
 cp hooks/footer_hook.py ~/.hermes/plugins/codex_usage_footer.py
 ```
 
@@ -146,11 +194,12 @@ reply.
 
 Use this instead if you want a *separate* notification sent to one fixed place (a
 desktop notification or a single webhook) regardless of which chat triggered it —
-for example when running the CLI. Both options need the shared module:
+for example when running the CLI. These hooks report Codex, but they render the
+summary through `usage.py`, so copy the shared modules:
 
 ```bash
 mkdir -p ~/.hermes/lib
-cp codex_usage.py ~/.hermes/lib/
+cp usage.py codex_usage.py minimax_usage.py ~/.hermes/lib/
 ```
 
 Then pick **one**.
