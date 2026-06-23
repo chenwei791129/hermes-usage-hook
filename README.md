@@ -66,10 +66,6 @@ MiniMax 5h | used 4%, left 96% (resets in 281 min)
 
 (MiniMax has no plan tier, so the `| plan …` segment is omitted.)
 
-> **Scope:** auto-detection applies to the **footer hook** only, because it is
-> the only hook with a `model` in its context. The fixed-destination hooks
-> (`on_session_end`, `agent:end`) have no `model` and continue to report Codex.
-
 ### MiniMax API token
 
 The MiniMax fetcher needs an API token for
@@ -91,18 +87,11 @@ If neither yields a token, the MiniMax fetch fails and — like any fetch failur
 | `usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the provider-labeled summary (`format_summary`). |
 | `codex_usage.py` | Standalone module: read `auth.json`, refresh token, fetch and normalize Codex usage. |
 | `minimax_usage.py` | Standalone module: resolve the MiniMax API token, fetch and normalize MiniMax (international) `token_plan/remains` usage. |
-| `hooks/footer_hook.py` | Hermes **plugin hook** (`transform_llm_output`) — detects the provider from the reply's `model` and appends that provider's usage to each reply, **auto-routed back to the user's current platform** (Telegram → that chat, Discord → that channel). **Recommended.** |
-| `hooks/plugin_hook.py` | Hermes **plugin hook** (`on_session_end`) — sends a separate notification to a **fixed** destination (desktop / webhook). Runs in CLI **and** gateway. |
-| `hooks/gateway/HOOK.yaml` + `hooks/gateway/handler.py` | Hermes **gateway hook** (`agent:end`) — same fixed-destination notifier, gateway mode only. |
+| `hooks/footer_hook.py` | Hermes **plugin hook** (`transform_llm_output`) — detects the provider from the reply's `model` and appends that provider's usage to each reply, **auto-routed back to the user's current platform** (Telegram → that chat, Discord → that channel). |
 
-Two delivery styles, pick by what you want:
-
-- **Route to the user's current platform** → use `footer_hook.py`. The usage
-  rides on the agent's reply, so Hermes delivers it wherever the user is, with no
-  bot tokens and no per-platform code. (Caveat: streaming deployments — see below.)
-- **Notify a fixed destination** (a desktop notification or one webhook,
-  regardless of which chat triggered it) → use `plugin_hook.py` or the gateway
-  hook, configured via `CODEX_USAGE_NOTIFIER`.
+The footer hook is the sole delivery path: the usage rides on the agent's reply,
+so Hermes delivers it wherever the user is, with no bot tokens and no
+per-platform code. (Caveat: streaming deployments — see below.)
 
 ## Hermes hook reference
 
@@ -147,11 +136,9 @@ Everything else is a fire-and-forget observer.
 
 **What this project uses:** `footer_hook.py` subscribes to
 **`transform_llm_output`** (appends the usage to the reply, so it auto-routes to
-the user's platform — the recommended path). The fixed-destination variants use
-**`on_session_end`** (plugin, CLI + gateway) and **`agent:end`** (gateway only).
-None use `session:end`, which only fires when the whole messaging session ends,
-and to *actively* push at `agent:end` you would need the `chat_id` from its
-context plus each platform's API token — which is exactly what the footer avoids.
+the user's platform). It deliberately avoids `agent:end` / `session:end`: to
+*actively* push at those events you would need the `chat_id` from their context
+plus each platform's API token — which is exactly what the footer avoids.
 
 ## Quick check (before deploying)
 
@@ -166,7 +153,7 @@ python codex_usage.py
 
 You should see the normalized JSON plus a one-line summary.
 
-## Deploy the footer hook (recommended)
+## Deploy the footer hook
 
 Appends the usage to the agent's reply via `transform_llm_output`, so Hermes
 delivers it back to whatever platform the conversation came from (Telegram → that
@@ -187,65 +174,11 @@ Restart Hermes; it discovers `register(ctx)` and the footer appears under each
 reply.
 
 > **Streaming caveat:** if your deployment streams responses, the reply body is
-> already sent before this hook runs, so the footer may not be applied. If it
-> never appears, use the `agent:end` gateway hook below instead.
-
-## Deploy a fixed-destination notification (alternative)
-
-Use this instead if you want a *separate* notification sent to one fixed place (a
-desktop notification or a single webhook) regardless of which chat triggered it —
-for example when running the CLI. These hooks report Codex, but they render the
-summary through `usage.py`, so copy the shared modules:
-
-```bash
-mkdir -p ~/.hermes/lib
-cp usage.py codex_usage.py minimax_usage.py ~/.hermes/lib/
-```
-
-Then pick **one**.
-
-### Plugin hook — CLI + gateway
-
-`on_session_end` fires at the end of every conversation (CLI and gateway) and
-sends the notification to the configured destination.
-
-```bash
-mkdir -p ~/.hermes/plugins
-cp hooks/plugin_hook.py ~/.hermes/plugins/codex_usage_hook.py
-```
-
-### Gateway hook — gateway only
-
-Gateway hooks live in `~/.hermes/hooks/<name>/` as `HOOK.yaml` + `handler.py`.
-
-```bash
-mkdir -p ~/.hermes/hooks/codex-usage-notify
-cp hooks/plugin_hook.py ~/.hermes/lib/        # handler.py imports _notify from it
-cp hooks/gateway/HOOK.yaml hooks/gateway/handler.py ~/.hermes/hooks/codex-usage-notify/
-```
-
-Restart the gateway. On each `agent:end` event the handler fetches usage and
-notifies.
+> already sent before this hook runs, so the footer may not be applied.
 
 ## Configuration
 
 The footer hook needs no configuration — restart and it works.
-
-The fixed-destination notification selects where it goes with the
-`CODEX_USAGE_NOTIFIER` environment variable:
-
-| Value | Behavior |
-| --- | --- |
-| `macos` | macOS desktop notification via `osascript` (default on macOS). |
-| `webhook` | HTTP `POST {"text": ...}` to `CODEX_USAGE_WEBHOOK_URL` (Slack/Discord/your service). |
-| `stdout` | Print to stdout (default off macOS; handy while developing). |
-
-Example for a webhook target:
-
-```bash
-export CODEX_USAGE_NOTIFIER=webhook
-export CODEX_USAGE_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ"
-```
 
 `CODEX_HOME` is honored if your Codex install uses a non-default home.
 
