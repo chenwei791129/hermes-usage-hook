@@ -154,6 +154,24 @@ def test_get_usage_for_model_returns_none_when_unmatched():
     assert usage.get_usage_for_model(None) is None
 
 
+# --- Duration formatting (shared duration formatter) ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("minutes", "expected"),
+    [
+        (0, "0m"),
+        (45, "45m"),
+        (90, "1h30m"),
+        (137, "2h17m"),
+        (8640, "6d"),
+        (8880, "6d4h"),
+    ],
+)
+def test_format_duration_mapping(minutes, expected):
+    assert usage._format_duration(minutes) == expected
+
+
 # --- Summary formatting (Render a provider-labeled usage summary) --------------
 
 
@@ -162,13 +180,18 @@ def test_format_summary_codex_includes_plan():
         "provider": "Codex",
         "plan_type": "pro",
         "windows": {
-            "5h": {"used_percent": 42, "remaining_percent": 58, "reset_in_min": 137}
+            "5h": {"used_percent": 42, "remaining_percent": 58, "reset_in_min": 137},
+            "weekly": {
+                "used_percent": 10,
+                "remaining_percent": 90,
+                "reset_in_min": 8880,
+            },
         },
     }
 
-    assert (
-        usage.format_summary(codex)
-        == "Codex 5h | used 42%, left 58% (resets in 137 min) | plan pro"
+    assert usage.format_summary(codex) == (
+        "Codex 5h | used 42%, left 58% (resets in 2h17m) | plan pro\n"
+        "Codex weekly | used 10%, left 90% (resets in 6d4h)"
     )
 
 
@@ -177,20 +200,45 @@ def test_format_summary_minimax_omits_plan():
         "provider": "MiniMax",
         "plan_type": None,
         "windows": {
-            "5h": {"used_percent": 4, "remaining_percent": 96, "reset_in_min": 281}
+            "5h": {"used_percent": 4, "remaining_percent": 96, "reset_in_min": 281},
+            "weekly": {
+                "used_percent": 30,
+                "remaining_percent": 70,
+                "reset_in_min": 8640,
+            },
+        },
+    }
+
+    assert usage.format_summary(minimax) == (
+        "MiniMax 5h | used 4%, left 96% (resets in 4h41m)\n"
+        "MiniMax weekly | used 30%, left 70% (resets in 6d)"
+    )
+
+
+def test_format_summary_weekly_absent_renders_only_5h():
+    usage_dict = {
+        "provider": "Codex",
+        "plan_type": "pro",
+        "windows": {
+            "5h": {"used_percent": 42, "remaining_percent": 58, "reset_in_min": 137}
         },
     }
 
     assert (
-        usage.format_summary(minimax)
-        == "MiniMax 5h | used 4%, left 96% (resets in 281 min)"
+        usage.format_summary(usage_dict)
+        == "Codex 5h | used 42%, left 58% (resets in 2h17m) | plan pro"
     )
 
 
 def test_format_summary_reports_missing_window():
-    assert "unavailable" in usage.format_summary(
-        {"provider": "Codex", "plan_type": None, "windows": {}}
-    )
+    usage_dict = {
+        "provider": "Codex",
+        "plan_type": None,
+        # A weekly window must not leak through when 5h is unavailable.
+        "windows": {"weekly": {"used_percent": 10, "remaining_percent": 90}},
+    }
+
+    assert usage.format_summary(usage_dict) == "Codex usage: 5h window unavailable"
 
 
 def test_format_summary_omits_reset_clause_when_unknown():

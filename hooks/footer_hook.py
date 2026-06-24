@@ -1,7 +1,8 @@
-"""Hermes plugin hook: append the current provider's 5h usage as a reply footer.
+"""Hermes plugin hook: append the current provider's usage as a reply footer.
 
 Detects the provider from the reply's ``model`` (Codex or MiniMax) and appends
-that provider's usage; an unrecognized model leaves the reply unchanged.
+that provider's usage — a ``5h`` line plus a ``weekly`` line when available; an
+unrecognized model leaves the reply unchanged.
 
 Registers ``transform_llm_output``, which replaces the final response text just
 before Hermes delivers it. Because the footer rides on Hermes' normal delivery
@@ -39,8 +40,9 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
     """Append the usage footer; return None to leave the response unchanged.
 
     Detects the provider from the current reply's ``model`` and fetches that
-    provider's usage. An unrecognized model, or any fetch failure, leaves the
-    reply unchanged (returns None).
+    provider's usage, rendering its ``5h`` and ``weekly`` windows. An
+    unrecognized model, or any fetch failure, leaves the reply unchanged
+    (returns None).
     """
     if not response_text:
         return None
