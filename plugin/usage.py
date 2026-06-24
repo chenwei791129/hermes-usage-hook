@@ -17,7 +17,7 @@ second line for the ``weekly`` window, with reset times produced by the shared
 
 from __future__ import annotations
 
-from providers import codex_usage, minimax_usage
+from .providers import codex_usage, minimax_usage
 
 # Model-name prefixes that identify Codex even without the literal "codex".
 _CODEX_PREFIXES = ("gpt-", "o1", "o3", "o4")

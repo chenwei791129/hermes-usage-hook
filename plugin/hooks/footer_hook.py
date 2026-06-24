@@ -21,14 +21,9 @@ hook runs, so the rewrite may not take effect, and the footer may not appear.
 
 from __future__ import annotations
 
-import os
 import sys
 
-# Resolve the shared modules from the plugin's own root (the parent of hooks/),
-# so the plugin loads from a single installed directory regardless of location.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from usage import format_summary, get_usage_for_model  # noqa: E402
+from ..usage import format_summary, get_usage_for_model
 
 
 def register(ctx):
