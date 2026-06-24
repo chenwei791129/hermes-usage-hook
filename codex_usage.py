@@ -104,7 +104,7 @@ def _call_usage(access_token: str, account_id: str | None) -> dict:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "User-Agent": "hermes-codex-usage-hook",
+        "User-Agent": "hermes-usage-hook",
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id

@@ -134,7 +134,7 @@ def _call_usage(token: str) -> dict:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
-        "User-Agent": "hermes-codex-usage-hook",
+        "User-Agent": "hermes-usage-hook",
     }
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         resp = client.get(USAGE_URL, headers=headers)

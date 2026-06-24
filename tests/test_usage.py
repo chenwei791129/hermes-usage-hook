@@ -7,11 +7,18 @@ Run from the repo root so the flat modules are importable:
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 
 import codex_usage
 import minimax_usage
 import usage
+
+# footer_hook lives in the hooks/ package, not on the flat import path.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks"))
+import footer_hook  # noqa: E402
 
 
 def test_codex_normalize_tags_provider():
@@ -201,3 +208,19 @@ def test_format_summary_omits_reset_clause_when_unknown():
     assert (
         usage.format_summary(usage_dict) == "Codex 5h | used 42%, left 58% | plan pro"
     )
+
+
+# --- Footer hook failure handling (Failure never breaks the reply) -------------
+
+
+def test_footer_logs_prefixed_error_and_leaves_reply_unchanged(monkeypatch, capsys):
+    def _raise(_model):
+        raise RuntimeError("usage fetch exploded")
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", _raise)
+
+    result = footer_hook.append_usage_footer("original reply", model="gpt-5-codex")
+
+    # Returning None tells Hermes to keep the reply unchanged.
+    assert result is None
+    assert "[hermes-usage-hook]" in capsys.readouterr().err

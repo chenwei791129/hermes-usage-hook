@@ -1,4 +1,4 @@
-# hermes-codex-usage-hook
+# hermes-usage-hook
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) hook that reports
 your **Codex 5-hour rate-limit usage** at the end of every conversation.
@@ -161,13 +161,13 @@ chat, Discord → that channel). No bot tokens, no `chat_id`, no per-platform co
 and no configuration.
 
 ```bash
-git clone git@github.com:<you>/hermes-codex-usage-hook.git
-cd hermes-codex-usage-hook
+git clone git@github.com:<you>/hermes-usage-hook.git
+cd hermes-usage-hook
 
 # Shared modules + the footer plugin hook.
 mkdir -p ~/.hermes/lib ~/.hermes/plugins
 cp usage.py codex_usage.py minimax_usage.py ~/.hermes/lib/
-cp hooks/footer_hook.py ~/.hermes/plugins/codex_usage_footer.py
+cp hooks/footer_hook.py ~/.hermes/plugins/usage_footer.py
 ```
 
 Restart Hermes; it discovers `register(ctx)` and the footer appears under each
@@ -191,7 +191,7 @@ The footer hook needs no configuration — restart and it works.
   OAuth, the refresh token may be expired or revoked — re-run `codex login`.
 - **Nothing happens at conversation end** — confirm the file landed in the right
   directory and restart Hermes; hook errors are logged to stderr, prefixed
-  `[codex-usage-hook]`.
+  `[hermes-usage-hook]`.
 
 ## License
 
