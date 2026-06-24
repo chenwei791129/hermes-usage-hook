@@ -6,9 +6,11 @@
 """Fetch Codex (ChatGPT-backed) rate-limit usage.
 
 Reads the Codex OAuth credentials from ``$HERMES_HOME/auth.json`` when running
-as a Hermes plugin (where Hermes keeps them), falling back to the Codex CLI's
-``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use, and
-queries the usage endpoint codexbar uses, returning a normalized view of the
+as a Hermes plugin (where Hermes keeps them, nested per-provider under
+``providers/openai-codex``), falling back to the Codex CLI's flat
+``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; both
+layouts are supported. Queries the usage endpoint codexbar uses, returning a
+normalized view of the
 5-hour and weekly rate-limit windows. Refreshes the access token when stale or
 rejected, persisting the new token back to ``auth.json``.
 
@@ -61,12 +63,50 @@ def _auth_path() -> Path:
     return Path(home) / "auth.json"
 
 
+# Hermes stores per-provider credentials nested under ``providers/<name>``,
+# while the standalone Codex CLI uses a flat top-level layout. The rest of this
+# module consumes the Codex record (the dict carrying ``tokens``/``last_refresh``),
+# so normalize both layouts to that record on load and write it back into the
+# right slot on save.
+_HERMES_CODEX_PROVIDER = "openai-codex"
+
+
+def _codex_record(raw: dict) -> dict:
+    """Return the Codex credential record from either auth.json layout.
+
+    Hermes nests it under ``providers/openai-codex`` (alongside ``last_refresh``
+    and ``auth_mode``); the Codex CLI keeps ``tokens``/``last_refresh`` at the
+    top level. Returns the sub-dict carrying ``tokens`` in both cases.
+    """
+    providers = raw.get("providers")
+    if isinstance(providers, dict) and isinstance(
+        providers.get(_HERMES_CODEX_PROVIDER), dict
+    ):
+        return providers[_HERMES_CODEX_PROVIDER]
+    return raw
+
+
 def _load_auth() -> dict:
-    return json.loads(_auth_path().read_text())
+    return _codex_record(json.loads(_auth_path().read_text()))
 
 
 def _save_auth(auth: dict) -> None:
-    _auth_path().write_text(json.dumps(auth, indent=2))
+    """Persist the Codex record, preserving the on-disk auth.json layout.
+
+    Re-reads the file so a refreshed token is spliced back into Hermes' nested
+    ``providers/openai-codex`` slot, leaving other providers and top-level fields
+    intact; a flat Codex-CLI file is written back as-is.
+    """
+    path = _auth_path()
+    raw = json.loads(path.read_text())
+    providers = raw.get("providers")
+    if isinstance(providers, dict) and isinstance(
+        providers.get(_HERMES_CODEX_PROVIDER), dict
+    ):
+        providers[_HERMES_CODEX_PROVIDER] = auth
+    else:
+        raw = auth
+    path.write_text(json.dumps(raw, indent=2))
 
 
 def _needs_refresh(auth: dict) -> bool:
