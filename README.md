@@ -16,7 +16,7 @@ MiniMax weekly | used 30%, left 70% (resets in 6d)
 
 The summary rides on the agent's own reply, so Hermes delivers it wherever the
 conversation came from (Telegram → that chat, Discord → that channel) — no bot
-tokens, no per-platform code, and no configuration.
+tokens and no per-platform code.
 
 ## How it works
 
@@ -59,10 +59,12 @@ tier, so the `| plan …` segment is omitted.
 
 | File | Purpose |
 | --- | --- |
-| `usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the summary. |
-| `providers/codex_usage.py` | Read `auth.json`, refresh token, fetch and normalize Codex usage. |
-| `providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
-| `hooks/footer_hook.py` | The Hermes hook that appends the provider's usage to each reply. |
+| `plugin/plugin.yaml` | Hermes plugin manifest: declares the plugin name, `kind: standalone`, and the `transform_llm_output` hook it provides, so Hermes discovery recognizes the directory. |
+| `plugin/__init__.py` | Plugin root entry point: puts the plugin directory on `sys.path` and re-exports `register(ctx)` from the footer hook. |
+| `plugin/usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the summary. |
+| `plugin/providers/codex_usage.py` | Read `auth.json`, refresh token, fetch and normalize Codex usage. |
+| `plugin/providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
+| `plugin/hooks/footer_hook.py` | The Hermes hook that appends the provider's usage to each reply. |
 
 ## Quick check (before deploying)
 
@@ -70,29 +72,69 @@ Confirm you can fetch usage with your current login:
 
 ```bash
 # Requires the Codex CLI to be logged in (`codex login`) so ~/.codex/auth.json exists.
-uv run providers/codex_usage.py
+uv run plugin/providers/codex_usage.py
 # or, if httpx is already installed:
-python providers/codex_usage.py
+python plugin/providers/codex_usage.py
 ```
 
 You should see the normalized JSON plus the rendered summary.
 
 ## Install
 
+The plugin ships under the repo's `plugin/` subdirectory. The quickest way to
+install is the one-command installer, which copies that directory into Hermes'
+plugins dir and enables it for you:
+
 ```bash
 git clone git@github.com:chenwei791129/hermes-usage-hook.git
 cd hermes-usage-hook
-
-# Shared modules + the footer hook. Copy the whole providers/ package
-# (including its __init__.py) so the hook can import providers.* at startup.
-mkdir -p ~/.hermes/lib ~/.hermes/plugins
-cp usage.py ~/.hermes/lib/
-cp -r providers ~/.hermes/lib/
-cp hooks/footer_hook.py ~/.hermes/plugins/usage_footer.py
+uv run install.py
 ```
 
-Restart Hermes and the footer appears under each reply. No configuration is
-needed; `CODEX_HOME` is honored if your Codex install uses a non-default home.
+`install.py` copies `plugin/` to `$HERMES_HOME/plugins/hermes-usage-hook/`
+(`HERMES_HOME` defaults to `~/.hermes`) and adds `hermes-usage-hook` to
+`plugins.enabled` in `$HERMES_HOME/config.yaml`. Re-running it is safe — it
+overwrites the install and never duplicates the enable entry. Restart Hermes,
+and the footer appears under each reply.
+
+### Manual install (alternative)
+
+Hermes loads plugins as **directories** that contain a `plugin.yaml` manifest,
+and third-party (`kind: standalone`) plugins stay disabled until you enable them
+explicitly. So installation is two steps: install the directory, then enable it.
+
+**1. Install the plugin directory.** All plugin files live under the repo's
+`plugin/` subdirectory; install that subdirectory (not the whole repo, which
+also carries `tests/`, `openspec/`, and git metadata) into Hermes' plugins
+directory as `hermes-usage-hook/`:
+
+```bash
+git clone git@github.com:chenwei791129/hermes-usage-hook.git
+mkdir -p ~/.hermes/plugins
+
+# Copy just the plugin/ subdirectory (remove any previous copy first so a
+# re-install replaces it instead of nesting plugin/ inside the existing dir):
+rm -rf ~/.hermes/plugins/hermes-usage-hook
+cp -r hermes-usage-hook/plugin ~/.hermes/plugins/hermes-usage-hook
+# …or symlink it instead (handy during development):
+# ln -s "$(pwd)/hermes-usage-hook/plugin" ~/.hermes/plugins/hermes-usage-hook
+```
+
+**2. Enable the plugin.** Add `hermes-usage-hook` to `plugins.enabled` in
+`~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - hermes-usage-hook
+```
+
+or, equivalently, run `hermes plugins enable hermes-usage-hook`.
+
+**3. Confirm discovery.** Run `hermes plugins` — `hermes-usage-hook` should
+appear in the list (this confirms the manifest was found). Restart Hermes and
+the footer appears under each reply. `CODEX_HOME` is honored if your Codex
+install uses a non-default home.
 
 > **Streaming caveat:** if your deployment streams responses, the reply body is
 > already sent before this hook runs, so the footer may not be applied.
@@ -104,8 +146,10 @@ needed; `CODEX_HOME` is honored if your Codex install uses a non-default home.
   API-key-only `auth.json` is rejected; log in with a ChatGPT account
   (`codex login`). If you already use OAuth, the refresh token may be expired or
   revoked — re-run `codex login`.
-- **Nothing happens** — confirm the files landed in the right directories and
-  restart Hermes; hook errors are logged to stderr, prefixed `[hermes-usage-hook]`.
+- **Nothing happens** — confirm `hermes plugins` lists `hermes-usage-hook` (the
+  directory is installed and the manifest was found) and that it's in
+  `plugins.enabled` in `~/.hermes/config.yaml`, then restart Hermes. Hook errors
+  are logged to stderr, prefixed `[hermes-usage-hook]`.
 
 ## License
 
