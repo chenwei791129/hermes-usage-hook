@@ -49,4 +49,4 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
     except Exception as exc:  # noqa: BLE001 - never break the reply
         print(f"[hermes-usage-hook] skipped: {exc}", file=sys.stderr)
         return None
-    return f"{response_text}\n\n───\n\U0001f9ee {footer}"
+    return f"{response_text}\n\n───\n{footer}"
