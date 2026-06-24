@@ -355,23 +355,6 @@ def test_load_auth_reads_flat_codex_cli_layout(monkeypatch, tmp_path):
     assert codex_usage._load_auth() == flat
 
 
-def test_save_auth_splices_into_hermes_nested_layout(monkeypatch, tmp_path):
-    auth_file = tmp_path / "auth.json"
-    auth_file.write_text(json.dumps(_hermes_nested_auth()))
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    record = codex_usage._load_auth()
-    record["tokens"]["access_token"] = "rotated"
-    codex_usage._save_auth(record)
-
-    on_disk = json.loads(auth_file.read_text())
-    # The refreshed token lands back in the nested slot, and the surrounding
-    # Hermes structure (version, active_provider) is preserved.
-    assert on_disk["providers"]["openai-codex"]["tokens"]["access_token"] == "rotated"
-    assert on_disk["version"] == 1
-    assert on_disk["active_provider"] == "openai-codex"
-
-
 def test_get_codex_usage_reads_nested_hermes_layout(monkeypatch, tmp_path):
     (tmp_path / "auth.json").write_text(json.dumps(_hermes_nested_auth()))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -395,8 +378,8 @@ def test_get_codex_usage_reads_nested_hermes_layout(monkeypatch, tmp_path):
 
     usage = codex_usage.get_codex_usage()
 
-    # last_refresh is far in the future, so no refresh fires; the access token is
-    # read straight from the nested record.
+    # The access token is read straight from the nested record (the module never
+    # refreshes the token).
     assert captured["access_token"] == "access-tok"
     assert usage["provider"] == "Codex"
     assert usage["windows"]["5h"]["used_percent"] == 12

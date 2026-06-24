@@ -37,8 +37,10 @@ retrieved, the footer is simply skipped.
 
 Codex has no public usage API, so the hook reuses the OAuth credentials the
 Codex CLI stores in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) and queries
-the same internal endpoint the Codex CLI's `/status` uses. When the token is
-stale it refreshes automatically and writes the new token back.
+the same internal endpoint the Codex CLI's `/status` uses. The hook only **reads**
+the access token — it never refreshes or writes back. Under Hermes the credential
+store is Hermes' own, and Hermes keeps the token fresh; if the token is expired
+the usage call fails and the footer is simply omitted.
 
 > Codex's 5-hour window is an **account-wide** rolling quota, not a
 > per-conversation total — the same figure shown by the Codex CLI.
@@ -62,7 +64,7 @@ tier, so the `| plan …` segment is omitted.
 | `plugin/plugin.yaml` | Hermes plugin manifest: declares the plugin name, `kind: standalone`, and the `transform_llm_output` hook it provides, so Hermes discovery recognizes the directory. |
 | `plugin/__init__.py` | Plugin root entry point: puts the plugin directory on `sys.path` and re-exports `register(ctx)` from the footer hook. |
 | `plugin/usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the summary. |
-| `plugin/providers/codex_usage.py` | Read `auth.json`, refresh token, fetch and normalize Codex usage. |
+| `plugin/providers/codex_usage.py` | Read `auth.json` (read-only), fetch and normalize Codex usage. |
 | `plugin/providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
 | `plugin/hooks/footer_hook.py` | The Hermes hook that appends the provider's usage to each reply. |
 
@@ -159,8 +161,9 @@ install uses a non-default home.
 - **`auth.json` not found** — run `codex login` so the Codex CLI creates it.
 - **401/403** — the Codex usage endpoint needs ChatGPT **OAuth** credentials. An
   API-key-only `auth.json` is rejected; log in with a ChatGPT account
-  (`codex login`). If you already use OAuth, the refresh token may be expired or
-  revoked — re-run `codex login`.
+  (`codex login`). The hook does not refresh tokens: under Hermes, Hermes keeps
+  the access token fresh; standalone, an expired token means you re-run
+  `codex login`.
 - **Nothing happens** — confirm `hermes plugins` lists `hermes-usage-hook` (the
   directory is installed and the manifest was found) and that it's in
   `plugins.enabled` in `~/.hermes/config.yaml`, then restart Hermes. Hook errors
