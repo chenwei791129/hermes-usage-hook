@@ -5,8 +5,10 @@
 # ///
 """Fetch Codex (ChatGPT-backed) rate-limit usage.
 
-Reads the same OAuth credentials the Codex CLI writes to ``~/.codex/auth.json``
-and queries the usage endpoint codexbar uses, returning a normalized view of the
+Reads the Codex OAuth credentials from ``$HERMES_HOME/auth.json`` when running
+as a Hermes plugin (where Hermes keeps them), falling back to the Codex CLI's
+``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use, and
+queries the usage endpoint codexbar uses, returning a normalized view of the
 5-hour and weekly rate-limit windows. Refreshes the access token when stale or
 rejected, persisting the new token back to ``auth.json``.
 
@@ -42,7 +44,19 @@ WINDOW_WEEKLY = 604_800
 
 
 def _auth_path() -> Path:
-    """Locate auth.json, honoring CODEX_HOME like the Codex CLI does."""
+    """Locate auth.json.
+
+    Prefer Hermes' own credential store (``$HERMES_HOME/auth.json``) when it
+    exists: running as a Hermes plugin, that is where the active Codex OAuth
+    credential lives (Hermes does not populate the Codex CLI's ``~/.codex``).
+    Fall back to the Codex CLI location (``$CODEX_HOME/auth.json``, else
+    ``~/.codex/auth.json``) for standalone use.
+    """
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        hermes_auth = Path(hermes_home) / "auth.json"
+        if hermes_auth.is_file():
+            return hermes_auth
     home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
     return Path(home) / "auth.json"
 
