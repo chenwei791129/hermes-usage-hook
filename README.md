@@ -1,4 +1,4 @@
-# hermes-usage-hook
+# Hermes Usage Hook
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) hook that appends
 your **LLM provider's rate-limit usage** to the end of every reply.
