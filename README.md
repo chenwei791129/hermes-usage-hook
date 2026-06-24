@@ -4,11 +4,14 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) hook that appends
 your **LLM provider's rate-limit usage** to the end of every reply.
 
 It detects which provider produced the reply (Codex or MiniMax), fetches that
-provider's current usage, and appends a one-line summary such as:
+provider's current usage, and appends a summary — one line per available
+window (the 5h window, plus the weekly window when present) — such as:
 
 ```
-Codex 5h | used 42%, left 58% (resets in 137 min) | plan pro
-MiniMax 5h | used 4%, left 96% (resets in 281 min)
+Codex 5h | used 42%, left 58% (resets in 2h17m) | plan pro
+Codex weekly | used 10%, left 90% (resets in 6d4h)
+MiniMax 5h | used 4%, left 96% (resets in 4h41m)
+MiniMax weekly | used 30%, left 70% (resets in 6d)
 ```
 
 The summary rides on the agent's own reply, so Hermes delivers it wherever the
@@ -72,7 +75,7 @@ uv run providers/codex_usage.py
 python providers/codex_usage.py
 ```
 
-You should see the normalized JSON plus a one-line summary.
+You should see the normalized JSON plus the rendered summary.
 
 ## Install
 
