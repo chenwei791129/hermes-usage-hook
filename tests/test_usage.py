@@ -9,6 +9,9 @@ are importable as a package:
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from plugin import usage
@@ -267,3 +270,45 @@ def test_footer_logs_prefixed_error_and_leaves_reply_unchanged(monkeypatch, caps
     # Returning None tells Hermes to keep the reply unchanged.
     assert result is None
     assert "[hermes-usage-hook]" in capsys.readouterr().err
+
+
+# --- Codex auth.json location (prefer Hermes' store, fall back to Codex CLI) ----
+
+
+def test_auth_path_prefers_hermes_home_when_file_exists(monkeypatch, tmp_path):
+    # As a Hermes plugin, $HERMES_HOME/auth.json (where Hermes keeps the Codex
+    # OAuth credential) wins over the Codex CLI location, even if CODEX_HOME is set.
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", "/nonexistent/codex/home")
+
+    assert codex_usage._auth_path() == auth
+
+
+def test_auth_path_falls_back_to_codex_home_when_hermes_file_absent(
+    monkeypatch, tmp_path
+):
+    # HERMES_HOME is set but has no auth.json, so the Codex CLI location is used.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert codex_usage._auth_path() == codex_home / "auth.json"
+
+
+def test_auth_path_uses_codex_home_when_hermes_home_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert codex_usage._auth_path() == codex_home / "auth.json"
+
+
+def test_auth_path_defaults_to_user_codex_dir(monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    assert (
+        codex_usage._auth_path() == Path(os.path.expanduser("~/.codex")) / "auth.json"
+    )
