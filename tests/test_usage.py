@@ -9,6 +9,7 @@ are importable as a package:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -312,3 +313,73 @@ def test_auth_path_defaults_to_user_codex_dir(monkeypatch):
     assert (
         codex_usage._auth_path() == Path(os.path.expanduser("~/.codex")) / "auth.json"
     )
+
+
+# --- auth.json layout (Hermes nests per-provider; the Codex CLI is flat) -------
+
+
+def _hermes_nested_auth(access_token="access-tok", refresh_token="refresh-tok"):
+    """A minimal Hermes-shaped auth.json: credentials nested per-provider."""
+    return {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+                "last_refresh": "2099-01-01T00:00:00Z",
+                "auth_mode": "chatgpt",
+            }
+        },
+        "active_provider": "openai-codex",
+    }
+
+
+def test_load_auth_reads_hermes_nested_layout(monkeypatch, tmp_path):
+    (tmp_path / "auth.json").write_text(json.dumps(_hermes_nested_auth()))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "access-tok"
+    assert record["tokens"]["refresh_token"] == "refresh-tok"
+
+
+def test_load_auth_reads_flat_codex_cli_layout(monkeypatch, tmp_path):
+    flat = {"tokens": {"access_token": "flat-tok"}, "last_refresh": "x"}
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps(flat))
+
+    assert codex_usage._load_auth() == flat
+
+
+def test_get_codex_usage_reads_nested_hermes_layout(monkeypatch, tmp_path):
+    (tmp_path / "auth.json").write_text(json.dumps(_hermes_nested_auth()))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    captured = {}
+
+    def _fake_call(access_token, account_id):
+        captured["access_token"] = access_token
+        return {
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 12,
+                    "reset_at": None,
+                    "limit_window_seconds": codex_usage.WINDOW_5H,
+                }
+            },
+            "plan_type": "pro",
+        }
+
+    monkeypatch.setattr(codex_usage, "_call_usage", _fake_call)
+
+    usage = codex_usage.get_codex_usage()
+
+    # The access token is read straight from the nested record (the module never
+    # refreshes the token).
+    assert captured["access_token"] == "access-tok"
+    assert usage["provider"] == "Codex"
+    assert usage["windows"]["5h"]["used_percent"] == 12

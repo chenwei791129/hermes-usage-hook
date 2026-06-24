@@ -6,11 +6,17 @@
 """Fetch Codex (ChatGPT-backed) rate-limit usage.
 
 Reads the Codex OAuth credentials from ``$HERMES_HOME/auth.json`` when running
-as a Hermes plugin (where Hermes keeps them), falling back to the Codex CLI's
-``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use, and
-queries the usage endpoint codexbar uses, returning a normalized view of the
-5-hour and weekly rate-limit windows. Refreshes the access token when stale or
-rejected, persisting the new token back to ``auth.json``.
+as a Hermes plugin (where Hermes keeps them, nested per-provider under
+``providers/openai-codex``), falling back to the Codex CLI's flat
+``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; both
+layouts are supported. Queries the usage endpoint codexbar uses, returning a
+normalized view of the 5-hour and weekly rate-limit windows.
+
+This module never refreshes or writes back the token: the credential store may
+be Hermes' own live store, and rotating the refresh token out from under Hermes
+could break the deployment's login. It only reads the access token. If that
+token is expired, the usage call fails and the hook simply omits the footer
+(Hermes owns the token lifecycle and keeps it fresh).
 
 Run standalone for a quick check:
 
@@ -24,18 +30,12 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
-# Public Codex OAuth client id, identical to the one the Codex CLI ships with.
-OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-TOKEN_URL = "https://auth.openai.com/oauth/token"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
-# Codex marks a stored token stale after roughly 8 days; refresh before that.
-REFRESH_AFTER_DAYS = 8
 HTTP_TIMEOUT = 30.0
 
 # Window lengths used to label rate-limit buckets (seconds).
@@ -61,57 +61,30 @@ def _auth_path() -> Path:
     return Path(home) / "auth.json"
 
 
+# Hermes stores per-provider credentials nested under ``providers/<name>``,
+# while the standalone Codex CLI uses a flat top-level layout. The rest of this
+# module consumes the Codex record (the dict carrying ``tokens``), so normalize
+# both layouts to that record on load.
+_HERMES_CODEX_PROVIDER = "openai-codex"
+
+
+def _codex_record(raw: dict) -> dict:
+    """Return the Codex credential record from either auth.json layout.
+
+    Hermes nests it under ``providers/openai-codex`` (alongside ``auth_mode``);
+    the Codex CLI keeps ``tokens`` at the top level. Returns the sub-dict
+    carrying ``tokens`` in both cases.
+    """
+    providers = raw.get("providers")
+    if isinstance(providers, dict) and isinstance(
+        providers.get(_HERMES_CODEX_PROVIDER), dict
+    ):
+        return providers[_HERMES_CODEX_PROVIDER]
+    return raw
+
+
 def _load_auth() -> dict:
-    return json.loads(_auth_path().read_text())
-
-
-def _save_auth(auth: dict) -> None:
-    _auth_path().write_text(json.dumps(auth, indent=2))
-
-
-def _needs_refresh(auth: dict) -> bool:
-    """True when the stored token is missing a timestamp or older than the cap."""
-    last = auth.get("last_refresh")
-    if not last:
-        return True
-    try:
-        ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return True
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - ts).days >= REFRESH_AFTER_DAYS
-
-
-def _refresh(auth: dict) -> dict:
-    """Exchange the refresh token for a fresh access token and persist it."""
-    tokens = auth.get("tokens", {})
-    refresh_token = tokens.get("refresh_token")
-    if not refresh_token:
-        raise RuntimeError("auth.json has no refresh_token; run `codex login` again")
-
-    body = {
-        "client_id": OAUTH_CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "scope": "openid profile email",
-    }
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        resp = client.post(
-            TOKEN_URL, json=body, headers={"Content-Type": "application/json"}
-        )
-        resp.raise_for_status()
-        new = resp.json()
-
-    # Keep prior values for any field the refresh response omits.
-    tokens["access_token"] = new.get("access_token", tokens.get("access_token"))
-    tokens["refresh_token"] = new.get("refresh_token", tokens.get("refresh_token"))
-    if new.get("id_token"):
-        tokens["id_token"] = new["id_token"]
-    auth["tokens"] = tokens
-    auth["last_refresh"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _save_auth(auth)
-    return auth
+    return _codex_record(json.loads(_auth_path().read_text()))
 
 
 def _call_usage(access_token: str, account_id: str | None) -> dict:
@@ -163,39 +136,26 @@ def _normalize(raw: dict) -> dict:
 
 
 def get_codex_usage() -> dict:
-    """Return normalized Codex usage, refreshing the token when needed.
+    """Return normalized Codex usage from the stored access token.
 
     Synchronous on purpose: the ``transform_llm_output`` hook consumes the
     result as a plain string, so the fetch must run inline. Async hooks call
     this via ``asyncio.to_thread`` to avoid blocking the event loop.
 
-    Raises on unrecoverable errors (missing auth.json, network failure, a
-    non-auth HTTP error). Callers running inside a hook should wrap this in a
-    try/except so a failure never breaks the agent.
+    Reads the access token as-is and never refreshes it (see the module
+    docstring). Raises on unrecoverable errors (missing auth.json, network
+    failure, an HTTP error including an expired/rejected token). Callers running
+    inside a hook should wrap this in a try/except so a failure never breaks the
+    agent — an expired token then just omits the footer.
     """
     auth = _load_auth()
-    # Only OAuth credentials can be refreshed; API-key-only auth.json has no
-    # refresh_token, so skip the refresh path entirely for it.
-    can_refresh = bool(auth.get("tokens", {}).get("refresh_token"))
-    if can_refresh and _needs_refresh(auth):
-        auth = _refresh(auth)
-
     tokens = auth.get("tokens", {})
     access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
     if not access_token:
         raise RuntimeError("auth.json has no usable access token")
     account_id = tokens.get("account_id")
 
-    try:
-        raw = _call_usage(access_token, account_id)
-    except httpx.HTTPStatusError as exc:
-        # A stale token can still slip past the age check; refresh once and retry.
-        if exc.response.status_code in (401, 403) and can_refresh:
-            auth = _refresh(auth)
-            access_token = auth["tokens"]["access_token"]
-            raw = _call_usage(access_token, account_id)
-        else:
-            raise
+    raw = _call_usage(access_token, account_id)
     return _normalize(raw)
 
 
