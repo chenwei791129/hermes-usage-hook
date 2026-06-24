@@ -12,7 +12,7 @@ shared with ``codex_usage``. Pure API key auth -- no OAuth refresh.
 
 Run standalone for a quick check:
 
-    uv run providers/minimax_usage.py
+    uv run plugin/providers/minimax_usage.py
 """
 
 from __future__ import annotations

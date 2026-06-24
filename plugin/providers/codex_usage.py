@@ -12,9 +12,9 @@ rejected, persisting the new token back to ``auth.json``.
 
 Run standalone for a quick check:
 
-    uv run providers/codex_usage.py
+    uv run plugin/providers/codex_usage.py
     # or, if httpx is already installed:
-    python providers/codex_usage.py
+    python plugin/providers/codex_usage.py
 """
 
 from __future__ import annotations

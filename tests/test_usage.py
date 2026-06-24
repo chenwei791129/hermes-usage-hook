@@ -1,23 +1,18 @@
 """Tests for multi-provider usage detection, normalization, and formatting.
 
-Run from the repo root so the providers package and usage module are importable:
+``tests/conftest.py`` puts ``plugin/`` on ``sys.path`` so the ``usage`` and
+``providers`` modules (which ship under ``plugin/``) are importable:
 
-    uv run --with pytest --with httpx python -m pytest tests/test_usage.py -v
+    uv run --with pytest --with httpx --with pyyaml python -m pytest tests -v
 """
 
 from __future__ import annotations
 
-import os
-import sys
-
 import pytest
 
+import footer_hook
 import usage
 from providers import codex_usage, minimax_usage
-
-# footer_hook lives in the hooks/ package, not on the flat import path.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks"))
-import footer_hook  # noqa: E402
 
 
 def test_codex_normalize_tags_provider():
