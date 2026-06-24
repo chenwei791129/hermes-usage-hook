@@ -75,4 +75,4 @@ The system SHALL provide `format_summary(usage)` that consumes only the normaliz
 #### Scenario: Failure never breaks the reply
 
 - **WHEN** provider detection or usage fetching raises an exception during the footer hook
-- **THEN** the hook swallows the error, logs it to stderr prefixed `[codex-usage-hook]`, and returns the reply unchanged
+- **THEN** the hook swallows the error, logs it to stderr prefixed `[hermes-usage-hook]`, and returns the reply unchanged
