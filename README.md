@@ -57,8 +57,8 @@ tier, so the `| plan …` segment is omitted.
 | File | Purpose |
 | --- | --- |
 | `usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the summary. |
-| `codex_usage.py` | Read `auth.json`, refresh token, fetch and normalize Codex usage. |
-| `minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
+| `providers/codex_usage.py` | Read `auth.json`, refresh token, fetch and normalize Codex usage. |
+| `providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
 | `hooks/footer_hook.py` | The Hermes hook that appends the provider's usage to each reply. |
 
 ## Quick check (before deploying)
@@ -67,9 +67,9 @@ Confirm you can fetch usage with your current login:
 
 ```bash
 # Requires the Codex CLI to be logged in (`codex login`) so ~/.codex/auth.json exists.
-uv run codex_usage.py
+uv run providers/codex_usage.py
 # or, if httpx is already installed:
-python codex_usage.py
+python providers/codex_usage.py
 ```
 
 You should see the normalized JSON plus a one-line summary.
@@ -80,9 +80,11 @@ You should see the normalized JSON plus a one-line summary.
 git clone git@github.com:chenwei791129/hermes-usage-hook.git
 cd hermes-usage-hook
 
-# Shared modules + the footer hook.
+# Shared modules + the footer hook. Copy the whole providers/ package
+# (including its __init__.py) so the hook can import providers.* at startup.
 mkdir -p ~/.hermes/lib ~/.hermes/plugins
-cp usage.py codex_usage.py minimax_usage.py ~/.hermes/lib/
+cp usage.py ~/.hermes/lib/
+cp -r providers ~/.hermes/lib/
 cp hooks/footer_hook.py ~/.hermes/plugins/usage_footer.py
 ```
 

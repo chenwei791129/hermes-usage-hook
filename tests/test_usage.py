@@ -1,6 +1,6 @@
 """Tests for multi-provider usage detection, normalization, and formatting.
 
-Run from the repo root so the flat modules are importable:
+Run from the repo root so the providers package and usage module are importable:
 
     uv run --with pytest --with httpx python -m pytest tests/test_usage.py -v
 """
@@ -12,9 +12,8 @@ import sys
 
 import pytest
 
-import codex_usage
-import minimax_usage
 import usage
+from providers import codex_usage, minimax_usage
 
 # footer_hook lives in the hooks/ package, not on the flat import path.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks"))

@@ -12,7 +12,7 @@ shared with ``codex_usage``. Pure API key auth -- no OAuth refresh.
 
 Run standalone for a quick check:
 
-    uv run minimax_usage.py
+    uv run providers/minimax_usage.py
 """
 
 from __future__ import annotations
@@ -158,9 +158,12 @@ def _handle_sigterm(signum, frame):
 
 if __name__ == "__main__":
     import signal
+    import sys
 
-    # Deferred import avoids a circular import: usage imports this module at
-    # top level, while this module only needs format_summary when run directly.
+    # Add the repo root so the deferred ``from usage import`` below resolves the
+    # dispatch module one level up (running directly puts providers/ on path[0]).
+    # Deferred to avoid a cycle: usage imports this module at top level.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from usage import format_summary
 
     signal.signal(signal.SIGTERM, _handle_sigterm)

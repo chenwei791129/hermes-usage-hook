@@ -15,8 +15,7 @@ one-line, provider-labeled footer.
 
 from __future__ import annotations
 
-import codex_usage
-import minimax_usage
+from providers import codex_usage, minimax_usage
 
 # Model-name prefixes that identify Codex even without the literal "codex".
 _CODEX_PREFIXES = ("gpt-", "o1", "o3", "o4")
