@@ -1,7 +1,8 @@
 """Tests for multi-provider usage detection, normalization, and formatting.
 
-``tests/conftest.py`` puts ``plugin/`` on ``sys.path`` so the ``usage`` and
-``providers`` modules (which ship under ``plugin/``) are importable:
+``tests/conftest.py`` puts the repo root on ``sys.path`` so the plugin's
+``plugin.usage`` and ``plugin.providers`` modules (which ship under ``plugin/``)
+are importable as a package:
 
     uv run --with pytest --with httpx --with pyyaml python -m pytest tests -v
 """
@@ -10,9 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-import footer_hook
-import usage
-from providers import codex_usage, minimax_usage
+from plugin import usage
+from plugin.hooks import footer_hook
+from plugin.providers import codex_usage, minimax_usage
 
 
 def test_codex_normalize_tags_provider():

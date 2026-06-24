@@ -193,11 +193,15 @@ if __name__ == "__main__":
     import signal
     import sys
 
-    # Add the repo root so the deferred ``from usage import`` below resolves the
-    # dispatch module one level up (running directly puts providers/ on path[0]).
-    # Deferred to avoid a cycle: usage imports this module at top level.
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from usage import format_summary
+    # Add the repo root so ``plugin`` is importable as a package, letting the
+    # deferred import resolve ``usage`` with package context (its ``.providers``
+    # relative import needs a parent package). Deferred to avoid a cycle: usage
+    # imports this module at top level.
+    _repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    sys.path.insert(0, _repo_root)
+    from plugin.usage import format_summary
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
