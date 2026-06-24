@@ -6,9 +6,9 @@
 """Fetch Codex (ChatGPT-backed) rate-limit usage.
 
 Reads the Codex OAuth credentials from ``$HERMES_HOME/auth.json`` when running
-as a Hermes plugin (where Hermes keeps them, nested per-provider under
-``providers/openai-codex``), falling back to the Codex CLI's flat
-``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; both
+as a Hermes plugin (where Hermes keeps them under ``providers/openai-codex`` or
+newer ``credential_pool.openai-codex`` records), falling back to the Codex CLI's
+flat ``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; all
 layouts are supported. Queries the usage endpoint codexbar uses, returning a
 normalized view of the 5-hour and weekly rate-limit windows.
 
@@ -69,17 +69,40 @@ _HERMES_CODEX_PROVIDER = "openai-codex"
 
 
 def _codex_record(raw: dict) -> dict:
-    """Return the Codex credential record from either auth.json layout.
+    """Return the Codex credential record from supported auth.json layouts.
 
-    Hermes nests it under ``providers/openai-codex`` (alongside ``auth_mode``);
-    the Codex CLI keeps ``tokens`` at the top level. Returns the sub-dict
-    carrying ``tokens`` in both cases.
+    Hermes may nest credentials under ``providers/openai-codex`` or store a
+    prioritized credential list under ``credential_pool/openai-codex``. The Codex
+    CLI keeps ``tokens`` at the top level. Return a normalized dict carrying
+    ``tokens`` in all cases.
     """
     providers = raw.get("providers")
     if isinstance(providers, dict) and isinstance(
         providers.get(_HERMES_CODEX_PROVIDER), dict
     ):
         return providers[_HERMES_CODEX_PROVIDER]
+
+    pool = raw.get("credential_pool")
+    pool_records = pool.get(_HERMES_CODEX_PROVIDER) if isinstance(pool, dict) else None
+    if isinstance(pool_records, list):
+        usable_records = [
+            record
+            for record in pool_records
+            if isinstance(record, dict) and record.get("access_token")
+        ]
+        if usable_records:
+            record = sorted(
+                usable_records,
+                key=lambda item: item.get("priority", 100),
+            )[0]
+            return {
+                "tokens": {
+                    "access_token": record.get("access_token"),
+                    "refresh_token": record.get("refresh_token"),
+                    "account_id": record.get("account_id"),
+                }
+            }
+
     return raw
 
 

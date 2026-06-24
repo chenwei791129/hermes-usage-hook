@@ -35,10 +35,13 @@ retrieved, the footer is simply skipped.
 
 ### Codex usage
 
-Codex has no public usage API, so the hook reuses the OAuth credentials the
-Codex CLI stores in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) and queries
-the same internal endpoint the Codex CLI's `/status` uses. The hook only **reads**
-the access token — it never refreshes or writes back. Under Hermes the credential
+Codex has no public usage API, so the hook reuses OAuth credentials from
+Hermes' credential store (`$HERMES_HOME/auth.json`, including both
+`providers.openai-codex` and `credential_pool.openai-codex` layouts) or, when
+run standalone, the Codex CLI store in `~/.codex/auth.json` (or
+`$CODEX_HOME/auth.json`). It queries the same internal endpoint the Codex CLI's
+`/status` uses. The hook only **reads** the access token — it never refreshes or
+writes back. Under Hermes the credential
 store is Hermes' own, and Hermes keeps the token fresh; if the token is expired
 the usage call fails and the footer is simply omitted.
 
