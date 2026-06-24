@@ -66,6 +66,21 @@ tier, so the `| plan …` segment is omitted.
 | `plugin/providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
 | `plugin/hooks/footer_hook.py` | The Hermes hook that appends the provider's usage to each reply. |
 
+## Local development
+
+The repo root holds a development-only `pyproject.toml` (it is **not** shipped —
+`install.py` copies only `plugin/`). It pins the runtime dependencies to the
+versions Hermes provides (`httpx==0.28.1`, `pyyaml==6.0.3`) and declares the dev
+tools (`pytest`, `ruff`, `ty`), so local checks run against the same versions
+the plugin sees at load time. Create the environment with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync            # create .venv with pinned runtime deps + dev tools
+uv run pytest      # run the test suite under tests/
+uv run ruff check .
+uv run ty check
+```
+
 ## Quick check (before deploying)
 
 Confirm you can fetch usage with your current login:

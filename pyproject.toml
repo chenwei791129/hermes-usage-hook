@@ -1,0 +1,36 @@
+[project]
+# Development workspace metadata only. This project is NOT a distributable
+# package: install.py ships only the plugin/ directory, so this file never
+# reaches the installed plugin (see [tool.uv] package = false below).
+name = "hermes-codex-usage-hook"
+version = "0"
+requires-python = ">=3.10"
+# Runtime deps pinned to the Hermes host versions so local tests and standalone
+# quick-checks run against the exact versions Hermes provides at plugin load.
+dependencies = [
+    "httpx==0.28.1",
+    "pyyaml==6.0.3",
+]
+
+[dependency-groups]
+# PEP 735 dev group: tooling, never shipped. Installed by `uv sync` by default.
+dev = [
+    "pytest",
+    "ruff",
+    "ty",
+]
+
+[tool.uv]
+# Non-package mode: sync the environment with declared deps without trying to
+# build/install this repo as a package.
+package = false
+
+[tool.ruff]
+# Align with requires-python; preserve ruff's default rule selection (no new
+# rules introduced by this change).
+target-version = "py310"
+
+[tool.pytest.ini_options]
+# Limit collection to tests/. Import paths stay owned by tests/conftest.py;
+# intentionally no pythonpath here.
+testpaths = ["tests"]
