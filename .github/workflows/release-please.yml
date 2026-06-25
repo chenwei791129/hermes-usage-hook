@@ -1,0 +1,26 @@
+name: release-please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Serialize runs so rapid back-to-back merges don't run release-please
+# concurrently. cancel-in-progress stays false: the release job (tag + GitHub
+# Release creation on PR merge) is multi-step and must never be interrupted
+# mid-flight, so superseded runs queue rather than cancel.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # config-file / manifest-file omitted: the files use release-please's
+      # default names (release-please-config.json, .release-please-manifest.json).
+      - uses: googleapis/release-please-action@v4
