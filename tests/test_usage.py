@@ -315,7 +315,7 @@ def test_auth_path_defaults_to_user_codex_dir(monkeypatch):
     )
 
 
-# --- auth.json layout (Hermes nests per-provider; the Codex CLI is flat) -------
+# --- auth.json layout (Hermes provider nesting, credential pool, Codex CLI flat) -------
 
 
 def _hermes_nested_auth(access_token="access-tok", refresh_token="refresh-tok"):
@@ -336,6 +336,37 @@ def _hermes_nested_auth(access_token="access-tok", refresh_token="refresh-tok"):
     }
 
 
+def _hermes_credential_pool_auth():
+    """A minimal Hermes auth.json with pooled OpenAI Codex credentials."""
+    return {
+        "version": 2,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "secondary",
+                    "priority": 20,
+                    "access_token": "secondary-access-tok",
+                    "refresh_token": "secondary-refresh-tok",
+                },
+                {
+                    "id": "primary",
+                    "priority": 10,
+                    "access_token": "pool-access-tok",
+                    "refresh_token": "pool-refresh-tok",
+                    "account_id": "account-123",
+                },
+                {
+                    "id": "missing-token",
+                    "priority": 1,
+                    "refresh_token": "ignored-refresh-tok",
+                },
+            ]
+        },
+        "active_provider": "openai-codex",
+    }
+
+
 def test_load_auth_reads_hermes_nested_layout(monkeypatch, tmp_path):
     (tmp_path / "auth.json").write_text(json.dumps(_hermes_nested_auth()))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -344,6 +375,135 @@ def test_load_auth_reads_hermes_nested_layout(monkeypatch, tmp_path):
 
     assert record["tokens"]["access_token"] == "access-tok"
     assert record["tokens"]["refresh_token"] == "refresh-tok"
+
+
+def test_load_auth_reads_hermes_credential_pool_layout(monkeypatch, tmp_path):
+    (tmp_path / "auth.json").write_text(json.dumps(_hermes_credential_pool_auth()))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"] == {
+        "access_token": "pool-access-tok",
+        "refresh_token": "pool-refresh-tok",
+        "account_id": "account-123",
+    }
+
+
+def test_load_auth_prefers_hermes_nested_layout_over_credential_pool(
+    monkeypatch, tmp_path
+):
+    auth = _hermes_credential_pool_auth()
+    auth["providers"] = _hermes_nested_auth(
+        access_token="nested-access-tok",
+        refresh_token="nested-refresh-tok",
+    )["providers"]
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "nested-access-tok"
+    assert record["tokens"]["refresh_token"] == "nested-refresh-tok"
+
+
+def _pool_auth(records):
+    """Wrap pooled OpenAI Codex credential records in a Hermes-shaped auth.json."""
+    return {
+        "version": 2,
+        "providers": {},
+        "credential_pool": {"openai-codex": records},
+        "active_provider": "openai-codex",
+    }
+
+
+# Epoch seconds far enough from now to read as a definite future/past cooldown
+# without monkeypatching the clock (year ~2286 vs the Unix epoch + 1s).
+_FUTURE_EPOCH = 9_999_999_999
+_PAST_EPOCH = 1
+
+
+def test_load_auth_skips_dead_pool_record(monkeypatch, tmp_path):
+    # The highest-priority credential is terminally dead (token invalidated):
+    # Hermes drops it from rotation, so the hook must fall through to the next.
+    auth = _pool_auth(
+        [
+            {
+                "id": "primary",
+                "priority": 10,
+                "access_token": "dead-access-tok",
+                "last_status": "dead",
+            },
+            {
+                "id": "secondary",
+                "priority": 20,
+                "access_token": "live-access-tok",
+                "last_status": "ok",
+            },
+        ]
+    )
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "live-access-tok"
+
+
+def test_load_auth_skips_exhausted_pool_record_in_cooldown(monkeypatch, tmp_path):
+    # Top-priority credential is rate-limited with a reset window still in the
+    # future: Hermes runs on the next one, so the hook must too.
+    auth = _pool_auth(
+        [
+            {
+                "id": "primary",
+                "priority": 10,
+                "access_token": "exhausted-access-tok",
+                "last_status": "exhausted",
+                "last_error_reset_at": _FUTURE_EPOCH,
+            },
+            {
+                "id": "secondary",
+                "priority": 20,
+                "access_token": "live-access-tok",
+                "last_status": "ok",
+            },
+        ]
+    )
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "live-access-tok"
+
+
+def test_load_auth_uses_exhausted_pool_record_after_cooldown(monkeypatch, tmp_path):
+    # Once the cooldown has elapsed, Hermes reactivates the credential; the hook
+    # keeps honoring priority order and lets the live usage call be the judge.
+    auth = _pool_auth(
+        [
+            {
+                "id": "primary",
+                "priority": 10,
+                "access_token": "recovered-access-tok",
+                "last_status": "exhausted",
+                "last_error_reset_at": _PAST_EPOCH,
+            },
+            {
+                "id": "secondary",
+                "priority": 20,
+                "access_token": "live-access-tok",
+                "last_status": "ok",
+            },
+        ]
+    )
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "recovered-access-tok"
 
 
 def test_load_auth_reads_flat_codex_cli_layout(monkeypatch, tmp_path):
@@ -383,3 +543,35 @@ def test_get_codex_usage_reads_nested_hermes_layout(monkeypatch, tmp_path):
     assert captured["access_token"] == "access-tok"
     assert usage["provider"] == "Codex"
     assert usage["windows"]["5h"]["used_percent"] == 12
+
+
+def test_get_codex_usage_reads_credential_pool_layout(monkeypatch, tmp_path):
+    (tmp_path / "auth.json").write_text(json.dumps(_hermes_credential_pool_auth()))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    captured = {}
+
+    def _fake_call(access_token, account_id):
+        captured["access_token"] = access_token
+        captured["account_id"] = account_id
+        return {
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 34,
+                    "reset_at": None,
+                    "limit_window_seconds": codex_usage.WINDOW_5H,
+                }
+            },
+            "plan_type": "plus",
+        }
+
+    monkeypatch.setattr(codex_usage, "_call_usage", _fake_call)
+
+    usage = codex_usage.get_codex_usage()
+
+    assert captured == {
+        "access_token": "pool-access-tok",
+        "account_id": "account-123",
+    }
+    assert usage["provider"] == "Codex"
+    assert usage["windows"]["5h"]["used_percent"] == 34

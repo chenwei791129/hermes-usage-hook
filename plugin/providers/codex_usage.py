@@ -6,9 +6,9 @@
 """Fetch Codex (ChatGPT-backed) rate-limit usage.
 
 Reads the Codex OAuth credentials from ``$HERMES_HOME/auth.json`` when running
-as a Hermes plugin (where Hermes keeps them, nested per-provider under
-``providers/openai-codex``), falling back to the Codex CLI's flat
-``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; both
+as a Hermes plugin (where Hermes keeps them under ``providers/openai-codex`` or
+newer ``credential_pool.openai-codex`` records), falling back to the Codex CLI's
+flat ``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; all
 layouts are supported. Queries the usage endpoint codexbar uses, returning a
 normalized view of the 5-hour and weekly rate-limit windows.
 
@@ -67,19 +67,72 @@ def _auth_path() -> Path:
 # both layouts to that record on load.
 _HERMES_CODEX_PROVIDER = "openai-codex"
 
+# ``last_status`` values Hermes writes onto a pooled credential. ``dead`` is a
+# terminal server-side failure (token invalidated/revoked); ``exhausted`` is a
+# rate-limit/billing cooldown gated by ``last_error_reset_at``.
+_POOL_STATUS_DEAD = "dead"
+_POOL_STATUS_EXHAUSTED = "exhausted"
+
+
+def _pool_record_usable(record: dict) -> bool:
+    """Whether a ``credential_pool`` record is one Hermes would still select.
+
+    Mirrors Hermes' own rotation (``agent.credential_pool``): it excludes
+    ``dead`` credentials unconditionally and ``exhausted`` ones whose cooldown
+    window (``last_error_reset_at``) has not yet elapsed. Picking a credential
+    Hermes has retired would query the usage endpoint with a stale/invalid token
+    and show the wrong account (or silently drop the footer) while Hermes runs
+    on a healthy lower-priority credential.
+
+    For ``exhausted`` records with no recorded reset time we fall through and
+    let the live usage call be the source of truth, rather than replicating
+    Hermes' error-code-based TTL fallback.
+    """
+    if not isinstance(record, dict) or not record.get("access_token"):
+        return False
+    status = record.get("last_status")
+    if status == _POOL_STATUS_DEAD:
+        return False
+    if status == _POOL_STATUS_EXHAUSTED:
+        reset_at = record.get("last_error_reset_at")
+        if isinstance(reset_at, (int, float)) and reset_at > time.time():
+            return False
+    return True
+
 
 def _codex_record(raw: dict) -> dict:
-    """Return the Codex credential record from either auth.json layout.
+    """Return the Codex credential record from supported auth.json layouts.
 
-    Hermes nests it under ``providers/openai-codex`` (alongside ``auth_mode``);
-    the Codex CLI keeps ``tokens`` at the top level. Returns the sub-dict
-    carrying ``tokens`` in both cases.
+    Hermes may nest credentials under ``providers/openai-codex`` or store a
+    prioritized credential list under ``credential_pool/openai-codex``. The Codex
+    CLI keeps ``tokens`` at the top level. Return a normalized dict carrying
+    ``tokens`` in all cases.
     """
     providers = raw.get("providers")
     if isinstance(providers, dict) and isinstance(
         providers.get(_HERMES_CODEX_PROVIDER), dict
     ):
         return providers[_HERMES_CODEX_PROVIDER]
+
+    pool = raw.get("credential_pool")
+    pool_records = pool.get(_HERMES_CODEX_PROVIDER) if isinstance(pool, dict) else None
+    if isinstance(pool_records, list):
+        usable_records = [
+            record for record in pool_records if _pool_record_usable(record)
+        ]
+        if usable_records:
+            record = sorted(
+                usable_records,
+                key=lambda item: item.get("priority", 100),
+            )[0]
+            return {
+                "tokens": {
+                    "access_token": record.get("access_token"),
+                    "refresh_token": record.get("refresh_token"),
+                    "account_id": record.get("account_id"),
+                }
+            }
+
     return raw
 
 
