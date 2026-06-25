@@ -101,21 +101,72 @@ You should see the normalized JSON plus the rendered summary.
 
 ## Install
 
-The plugin ships under the repo's `plugin/` subdirectory. The quickest way to
-install is the one-command installer, which copies that directory into Hermes'
-plugins dir and enables it for you:
+The quickest way to install is the one-command installer, `install.py`. It runs
+**directly from its raw URL — no clone required** — and by default downloads the
+plugin from the project's latest GitHub release:
+
+```bash
+uv run https://raw.githubusercontent.com/chenwei791129/hermes-usage-hook/main/install.py
+```
+
+The installer downloads the latest release's source tarball, extracts the
+`plugin/` directory from it, copies that to `$HERMES_HOME/plugins/hermes-usage-hook/`
+(`HERMES_HOME` defaults to `~/.hermes`), and adds `hermes-usage-hook` to
+`plugins.enabled` in `$HERMES_HOME/config.yaml`. Re-running it is safe — it
+overwrites the install and never duplicates the enable entry. Restart Hermes,
+and the footer appears under each reply.
+
+> The default install needs network access to reach GitHub. **Offline?** Clone
+> the repo and install from the local `plugin/` with `--local` (see below).
+
+### Modes and flags
+
+`install.py` has two modes: `install` (the default when no subcommand is given)
+and `remove`. Download and extraction use only the Python standard library;
+`pyyaml` is the sole runtime dependency.
+
+**Install a specific release** with `--version` (the tag is matched with and
+without a leading `v`):
+
+```bash
+uv run https://raw.githubusercontent.com/chenwei791129/hermes-usage-hook/main/install.py --version 0.2.0
+```
+
+**Install from a local checkout** with `--local`. With no path it uses the
+`plugin/` directory next to the script (the classic clone-and-install flow); a
+remote invocation must pass an explicit existing path:
 
 ```bash
 git clone git@github.com:chenwei791129/hermes-usage-hook.git
 cd hermes-usage-hook
-uv run install.py
+uv run install.py --local
 ```
 
-`install.py` copies `plugin/` to `$HERMES_HOME/plugins/hermes-usage-hook/`
-(`HERMES_HOME` defaults to `~/.hermes`) and adds `hermes-usage-hook` to
-`plugins.enabled` in `$HERMES_HOME/config.yaml`. Re-running it is safe — it
-overwrites the install and never duplicates the enable entry. Restart Hermes,
-and the footer appears under each reply.
+`--local` and `--version` are mutually exclusive (a local directory has no
+release version).
+
+**Remove the plugin** with the `remove` subcommand. It deletes the installed
+directory and removes the `plugins.enabled` entry; both actions are idempotent:
+
+```bash
+uv run https://raw.githubusercontent.com/chenwei791129/hermes-usage-hook/main/install.py remove
+```
+
+`remove --version TAG` acts as a **version guard**: it reads the installed
+`plugin.yaml` and only removes the plugin when its version matches `TAG`,
+otherwise it exits non-zero without deleting anything.
+
+**Flags** (available in both modes unless noted):
+
+| Flag                 | Effect                                                                             |
+| -------------------- | ---------------------------------------------------------------------------------- |
+| `--version TAG`      | install a specific release tag (install), or guard removal by version (remove)     |
+| `--local [PATH]`     | install from a local directory instead of a release (install only)                 |
+| `--repo OWNER/NAME`  | source repository for downloads, default `chenwei791129/hermes-usage-hook` (install only) |
+| `--hermes-home PATH` | override the Hermes home dir; takes precedence over `HERMES_HOME` (default `~/.hermes`) |
+| `--no-enable`        | only copy/remove the plugin directory; do not touch `config.yaml`                  |
+| `--dry-run`          | print the planned actions without downloading, writing, or deleting anything       |
+| `-v`, `--verbose`    | emit diagnostic detail (resolved release tag, tarball URL, extraction path)        |
 
 ### Manual install (alternative)
 
