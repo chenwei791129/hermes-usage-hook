@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.2.0...v0.2.1) (2026-06-25)
+
+
+### Bug Fixes
+
+* support Codex credential pool auth ([#5](https://github.com/chenwei791129/hermes-usage-hook/issues/5)) ([7c796c1](https://github.com/chenwei791129/hermes-usage-hook/commit/7c796c1926ea87b7e69eea3d9bb4f5e3962f7669))
+
 ## [0.2.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.1.0...v0.2.0) (2026-06-25)
 
 
