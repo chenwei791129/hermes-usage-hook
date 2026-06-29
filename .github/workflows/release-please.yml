@@ -23,4 +23,4 @@ jobs:
     steps:
       # config-file / manifest-file omitted: the files use release-please's
       # default names (release-please-config.json, .release-please-manifest.json).
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
