@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.2.1...v0.2.2) (2026-07-13)
+
+
+### Bug Fixes
+
+* show weekly usage when 5h window is unavailable ([617a91f](https://github.com/chenwei791129/hermes-usage-hook/commit/617a91f6d3640654b2daa4201f2d6cf3b4d1a76b))
+
 ## [0.2.1](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.2.0...v0.2.1) (2026-06-25)
 
 
