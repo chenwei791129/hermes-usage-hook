@@ -723,6 +723,52 @@ def test_future_retry_after_blocks_without_new_uuid_or_post(tmp_path):
     assert pending["credit_id"] == "credit-1"
 
 
+def test_remote_timeout_success_is_reconciled_and_does_not_block_later_reset(
+    tmp_path,
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store, retry_after=900.0)
+
+    reconciled = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=100, credits=1),
+        session_id="sess-reconcile",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=100, credits=1)),
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert reconciled.status == "reset"
+    assert reconciled.after_remaining == 100
+    assert store.load()["pending"] is None
+    assert store.pop_notice("sess-reconcile", now=1_001.0) is not None
+
+    consumer = _Consumer(response={"status": "reset"})
+    later = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5, credits=1),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5, credits=1),
+            _eligible_usage(remaining=100, credits=0),
+        ),
+        credit_lister=_Lister(_valid_credit_list("credit-2")),
+        consumer=consumer,
+        uuid_factory=_Uuids("req-2"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_002.0,
+    )
+
+    assert later.status == "reset"
+    assert consumer.calls == [("req-2", "credit-2")]
+
+
 def test_retry_reuses_same_uuid_and_credit_id(tmp_path):
     store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
     _seed_pending(store)

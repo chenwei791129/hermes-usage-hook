@@ -603,7 +603,7 @@ def maybe_autoreset(
     store: Any = None,
     usage_fetcher: Callable[[], dict] | None = None,
     credit_lister: Callable[[], dict] | None = None,
-    consumer: Callable[[str, str | None], dict] | None = None,
+    consumer: Callable[[str, str | None], dict | None] | None = None,
     uuid_factory: Callable[[], object] | None = None,
     lock_factory: Callable[[], AbstractContextManager[bool]] | None = None,
     clock: Callable[[], float] = time.time,
@@ -635,22 +635,15 @@ def maybe_autoreset(
             return AutoResetResult("ineligible")
         before_remaining = weekly_remaining(initial_usage)
         before_credits = _usage_credit_count(initial_usage)
-        if not is_eligible(model=model, usage=initial_usage, config=effective):
-            return AutoResetResult(
-                "ineligible",
-                before_remaining=before_remaining,
-                before_credits=before_credits,
-            )
-
         now = clock()
         prelock_state = state_store.load()
+        prelock_pending = _pending_record(prelock_state)
         if state_store.cooldown_active(prelock_state, now=now):
             return AutoResetResult(
                 "cooldown",
                 before_remaining=before_remaining,
                 before_credits=before_credits,
             )
-        prelock_pending = _pending_record(prelock_state)
         if prelock_pending is not None:
             retry_after = prelock_pending.get("retry_after")
             if isinstance(retry_after, (int, float)) and now < retry_after:
@@ -659,6 +652,12 @@ def maybe_autoreset(
                     before_remaining=before_remaining,
                     before_credits=before_credits,
                 )
+        elif not is_eligible(model=model, usage=initial_usage, config=effective):
+            return AutoResetResult(
+                "ineligible",
+                before_remaining=before_remaining,
+                before_credits=before_credits,
+            )
 
         make_lock = lock_factory or (
             lambda: acquire_autoreset_lock(home=state_store.home, now=now)
@@ -700,17 +699,41 @@ def maybe_autoreset(
                 )
                 state_store.write(state)
                 return AutoResetResult("transient", message=str(exc))
-            if not isinstance(live_usage, dict) or not is_eligible(
+            if not isinstance(live_usage, dict):
+                return AutoResetResult("ineligible")
+            live_remaining = weekly_remaining(live_usage)
+            live_credits = _usage_credit_count(live_usage)
+            if pending is not None and live_remaining is not None:
+                if live_remaining > effective.threshold:
+                    before_remaining = pending.get("before_remaining")
+                    before_credits = pending.get("before_credits")
+                    state["pending"] = None
+                    _clear_cooldown(state)
+                    state_store.write(state)
+                    message = _notice_message(
+                        status="reset",
+                        before_remaining=before_remaining,
+                        after_remaining=live_remaining,
+                        before_credits=before_credits,
+                        after_credits=live_credits,
+                    )
+                    state_store.queue_notice(session_id, message, now=now)
+                    return AutoResetResult(
+                        "reset",
+                        before_remaining=before_remaining,
+                        after_remaining=live_remaining,
+                        before_credits=before_credits,
+                        after_credits=live_credits,
+                        after_usage=live_usage,
+                        message=message,
+                    )
+            elif pending is not None or not is_eligible(
                 model=model, usage=live_usage, config=effective
             ):
                 return AutoResetResult(
                     "ineligible",
-                    before_remaining=weekly_remaining(live_usage)
-                    if isinstance(live_usage, dict)
-                    else None,
-                    before_credits=_usage_credit_count(live_usage)
-                    if isinstance(live_usage, dict)
-                    else None,
+                    before_remaining=live_remaining,
+                    before_credits=live_credits,
                 )
 
             if pending is None:
