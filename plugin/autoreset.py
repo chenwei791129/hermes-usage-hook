@@ -507,13 +507,13 @@ class AutoResetStateStore:
     def queue_fallback_notice_locked(
         self, state: dict, session_id: str, message: str, *, now: float
     ) -> bool:
-        """Persist a notice while the caller holds the coordinator lock."""
-        if not session_id:
-            return False
-        notices = self._prune_fallback_notices(state, now)
-        notices[session_id] = {"message": message, "created_at": now}
+        """Persist terminal state and its notice in one coordinator-locked write."""
+        notice_persisted = bool(session_id)
+        if notice_persisted:
+            notices = self._prune_fallback_notices(state, now)
+            notices[session_id] = {"message": message, "created_at": now}
         self.write(state)
-        return True
+        return notice_persisted
 
     def pop_fallback_notice(
         self, session_id: str, *, now: float | None = None
@@ -1034,14 +1034,6 @@ def maybe_autoreset(
                         after_credits = _usage_credit_count(refreshed)
                 except Exception:
                     pass
-                _set_cooldown(
-                    state,
-                    now=now,
-                    seconds=COOLDOWN_SUCCESS_SECONDS,
-                    reason="success",
-                    clear_pending=True,
-                )
-                state_store.write(state)
                 message = _notice_message(
                     status=code,
                     before_remaining=before_remaining,
@@ -1049,16 +1041,16 @@ def maybe_autoreset(
                     before_credits=before_credits,
                     after_credits=after_credits,
                 )
-                try:
-                    notice_persisted = state_store.queue_notice(
-                        session_id, message, now=now
-                    )
-                except Exception:
-                    notice_persisted = False
-                if not notice_persisted:
-                    notice_persisted = state_store.queue_fallback_notice_locked(
-                        state, session_id, message, now=now
-                    )
+                _set_cooldown(
+                    state,
+                    now=now,
+                    seconds=COOLDOWN_SUCCESS_SECONDS,
+                    reason="success",
+                    clear_pending=True,
+                )
+                notice_persisted = state_store.queue_fallback_notice_locked(
+                    state, session_id, message, now=now
+                )
                 return AutoResetResult(
                     code,
                     before_remaining=before_remaining,

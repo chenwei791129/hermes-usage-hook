@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 
 import httpx
 import pytest
@@ -929,7 +930,7 @@ def test_already_redeemed_is_successful_terminal(tmp_path):
     assert result.after_remaining == 100
     assert result.after_credits == 1
     assert store.load()["pending"] is None
-    assert store.pop_notice("sess-2", now=1_001.0) is not None
+    assert store.pop_fallback_notice("sess-2", now=1_001.0) is not None
 
 
 def test_nothing_to_reset_sets_five_minute_cooldown(tmp_path):
@@ -1172,7 +1173,7 @@ def test_two_contenders_cause_one_logical_consume(tmp_path):
     assert len(consumer.calls) == 1
 
 
-def test_success_queues_one_notice_for_session(tmp_path):
+def test_success_atomically_queues_one_notice_for_session(tmp_path):
     store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
 
     result = autoreset.maybe_autoreset(
@@ -1194,10 +1195,118 @@ def test_success_queues_one_notice_for_session(tmp_path):
 
     assert result.status == "reset"
     assert result.notice_persisted is True
-    message = store.pop_notice("sess-9", now=1_001.0)
+    message = store.pop_fallback_notice("sess-9", now=1_001.0)
     assert message is not None
     assert message.startswith("Codex auto reset")
-    assert store.pop_notice("sess-9", now=1_002.0) is None
+    assert store.pop_fallback_notice("sess-9", now=1_002.0) is None
+
+
+def test_terminal_success_write_atomically_contains_audit_notice(monkeypatch, tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    writes = []
+    queue_calls = []
+    real_write = store.write
+
+    def recording_write(state):
+        writes.append(json.loads(json.dumps(state)))
+        real_write(state)
+
+    def forbidden_separate_queue(*args, **kwargs):
+        queue_calls.append((args, kwargs))
+        raise AssertionError("success notice must use the terminal state write")
+
+    monkeypatch.setattr(store, "write", recording_write)
+    monkeypatch.setattr(store, "queue_notice", forbidden_separate_queue)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-atomic",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "reset"}),
+        uuid_factory=_Uuids("req-atomic"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    terminal_writes = [
+        state for state in writes if state.get("cooldown_reason") == "success"
+    ]
+    assert result.status == "reset"
+    assert result.notice_persisted is True
+    assert queue_calls == []
+    assert len(terminal_writes) == 1
+    assert terminal_writes[0]["pending"] is None
+    assert terminal_writes[0]["fallback_notices"]["sess-atomic"][
+        "message"
+    ].startswith("Codex auto reset")
+
+
+def test_failed_atomic_terminal_write_preserves_pending_for_safe_retry(
+    monkeypatch, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    first_consumer = _Consumer(response={"status": "reset"})
+    real_write = store.write
+
+    def fail_terminal_write(state):
+        if state.get("cooldown_reason") == "success":
+            raise OSError("simulated crash before atomic replace")
+        real_write(state)
+
+    monkeypatch.setattr(store, "write", fail_terminal_write)
+    first = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-recover",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=first_consumer,
+        uuid_factory=_Uuids("req-recover"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert first.status == "error"
+    pending = store.load()["pending"]
+    assert pending["redeem_request_id"] == "req-recover"
+    assert pending["credit_id"] == "credit-1"
+    assert store.pop_fallback_notice("sess-recover", now=1_000.5) is None
+
+    monkeypatch.setattr(store, "write", real_write)
+    retry_consumer = _Consumer(response={"status": "already_redeemed"})
+    retry = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-recover",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=100, credits=1),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_never,
+        consumer=retry_consumer,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_001.0,
+    )
+
+    assert retry.status == "already_redeemed"
+    assert retry_consumer.calls == [("req-recover", "credit-1")]
+    assert store.load()["pending"] is None
+    assert store.pop_fallback_notice("sess-recover", now=1_002.0) is not None
 
 
 def test_success_uses_locked_fallback_notice_when_notice_lock_is_busy(

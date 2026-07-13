@@ -629,7 +629,7 @@ def test_readme_documents_codex_autoreset_configuration():
         "autoreset-notices.json",
         "autoreset-notices.lock/",
         "five-minute suppression window",
-        "locked fallback notice",
+        "same coordinator-locked atomic write",
         "env → plugin config → defaults",
         "plugins.entries.<plugin_id>",
         "load_config()",
