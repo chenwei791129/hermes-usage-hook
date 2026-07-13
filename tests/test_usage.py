@@ -230,15 +230,22 @@ def test_format_summary_weekly_absent_renders_only_5h():
     )
 
 
-def test_format_summary_reports_missing_window():
+def test_format_summary_falls_back_to_weekly_when_5h_is_absent():
     usage_dict = {
         "provider": "Codex",
-        "plan_type": None,
-        # A weekly window must not leak through when 5h is unavailable.
-        "windows": {"weekly": {"used_percent": 10, "remaining_percent": 90}},
+        "plan_type": "plus",
+        "windows": {
+            "weekly": {
+                "used_percent": 10,
+                "remaining_percent": 90,
+                "reset_in_min": 8880,
+            }
+        },
     }
 
-    assert usage.format_summary(usage_dict) == "Codex usage: 5h window unavailable"
+    assert usage.format_summary(usage_dict) == (
+        "Codex weekly | used 10%, left 90% (resets in 6d4h) | plan plus"
+    )
 
 
 def test_format_summary_omits_reset_clause_when_unknown():
