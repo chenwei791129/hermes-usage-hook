@@ -90,6 +90,7 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
             if (
                 notice is None
                 and reset_result.status in {"reset", "already_redeemed"}
+                and not reset_result.notice_persisted
             ):
                 notice = reset_result.message
         except Exception as exc:  # noqa: BLE001 - preserve normal footer behavior

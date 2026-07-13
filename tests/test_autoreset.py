@@ -1129,6 +1129,7 @@ def test_success_queues_one_notice_for_session(tmp_path):
     )
 
     assert result.status == "reset"
+    assert result.notice_persisted is True
     message = store.pop_notice("sess-9", now=1_001.0)
     assert message is not None
     assert message.startswith("Codex auto reset")

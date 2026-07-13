@@ -592,6 +592,7 @@ class AutoResetResult:
     after_credits: int | None = None
     after_usage: dict | None = None
     message: str | None = None
+    notice_persisted: bool = False
 
 
 def _usage_credit_count(usage: dict) -> int | None:
@@ -904,7 +905,9 @@ def maybe_autoreset(
                     before_credits=before_credits,
                     after_credits=after_credits,
                 )
-                state_store.queue_notice(session_id, message, now=now)
+                notice_persisted = state_store.queue_notice(
+                    session_id, message, now=now
+                )
                 return AutoResetResult(
                     code,
                     before_remaining=before_remaining,
@@ -913,6 +916,7 @@ def maybe_autoreset(
                     after_credits=after_credits,
                     after_usage=after_usage,
                     message=message,
+                    notice_persisted=notice_persisted,
                 )
 
             if code in {"nothing_to_reset", "no_credit"}:

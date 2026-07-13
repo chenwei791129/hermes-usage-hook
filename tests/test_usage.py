@@ -527,6 +527,34 @@ def test_footer_never_renders_non_success_autoreset_messages(monkeypatch, status
     assert "Codex auto reset |" not in result
 
 
+def test_persisted_notice_pop_failure_never_uses_duplicate_message_fallback(monkeypatch):
+    notice = "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"
+    pops = [None, notice]
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(footer_hook, "_pop_notice", lambda _session_id: pops.pop(0))
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            "reset",
+            message=notice,
+            notice_persisted=True,
+        ),
+    )
+
+    first = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-lock"
+    )
+    second = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-lock"
+    )
+
+    assert first is not None
+    assert notice not in first
+    assert second is not None
+    assert second.count(notice) == 1
+
+
 def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
     monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
 
