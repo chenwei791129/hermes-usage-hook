@@ -9,13 +9,16 @@ are importable as a package:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
 
-import pytest
 import httpx
+import pytest
+import yaml
 
+from plugin import autoreset
 from plugin import usage
 from plugin.hooks import footer_hook
 from plugin.providers import codex_usage, minimax_usage
@@ -310,6 +313,217 @@ def test_footer_logs_prefixed_error_and_leaves_reply_unchanged(monkeypatch, caps
     # Returning None tells Hermes to keep the reply unchanged.
     assert result is None
     assert "[hermes-usage-hook]" in capsys.readouterr().err
+
+
+# --- Hook registration and Codex auto-reset integration -----------------------
+
+
+class _HookContext:
+    def __init__(self):
+        self.calls = []
+
+    def register_hook(self, hook_name, callback):
+        self.calls.append((hook_name, callback))
+
+
+def _codex_usage(*, remaining=10, credits=3):
+    return {
+        "provider": "Codex",
+        "plan_type": "plus",
+        "reset_credits_available": credits,
+        "windows": {
+            "weekly": {
+                "used_percent": 100 - remaining,
+                "remaining_percent": remaining,
+            }
+        },
+    }
+
+
+def test_register_adds_transform_and_pre_llm_hooks_exactly_once():
+    ctx = _HookContext()
+
+    footer_hook.register(ctx)
+
+    assert ctx.calls == [
+        ("transform_llm_output", footer_hook.append_usage_footer),
+        ("pre_llm_call", footer_hook.codex_autoreset_preflight),
+    ]
+
+
+def test_preflight_disabled_returns_none_without_network(monkeypatch):
+    calls = []
+
+    def fake_autoreset(**kwargs):
+        calls.append(kwargs)
+        return autoreset.AutoResetResult("disabled")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    result = footer_hook.codex_autoreset_preflight(
+        model="gpt-5-codex",
+        session_id="sess-1",
+        turn_id="turn-1",
+    )
+
+    assert result is None
+    assert len(calls) == 1
+
+
+def test_preflight_is_synchronous_and_never_injects_prompt_context(monkeypatch):
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("disabled"),
+    )
+
+    assert not inspect.iscoroutinefunction(footer_hook.codex_autoreset_preflight)
+    assert footer_hook.codex_autoreset_preflight(model="gpt-5-codex") is None
+
+
+def test_preflight_passes_session_turn_and_model(monkeypatch):
+    captured = {}
+
+    def fake_autoreset(**kwargs):
+        captured.update(kwargs)
+        return autoreset.AutoResetResult("disabled")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    footer_hook.codex_autoreset_preflight(
+        model="gpt-5-codex",
+        session_id="sess-2",
+        turn_id="turn-2",
+    )
+
+    assert captured == {
+        "model": "gpt-5-codex",
+        "session_id": "sess-2",
+        "turn_id": "turn-2",
+    }
+
+
+def test_footer_passes_existing_usage_to_coordinator(monkeypatch):
+    existing_usage = _codex_usage(remaining=50, credits=3)
+    captured = {}
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: existing_usage)
+
+    def fake_autoreset(**kwargs):
+        captured.update(kwargs)
+        return autoreset.AutoResetResult("ineligible")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-3"
+    )
+
+    assert captured["usage"] is existing_usage
+    assert captured["model"] == "gpt-5-codex"
+    assert captured["session_id"] == "sess-3"
+
+
+def test_footer_uses_refreshed_usage_after_reset(monkeypatch):
+    monkeypatch.setattr(
+        footer_hook,
+        "get_usage_for_model",
+        lambda _model: _codex_usage(remaining=0, credits=3),
+    )
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            "reset",
+            after_usage=_codex_usage(remaining=100, credits=2),
+            message="Codex auto reset | weekly 0% → 100% | reset credits 3 → 2",
+        ),
+    )
+
+    result = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-4"
+    )
+
+    assert result is not None
+    assert "Codex weekly | used 0%, left 100% | plan plus | reset credits 2" in result
+    assert "Codex weekly | used 100%, left 0% | plan plus | reset credits 3" not in result
+
+
+def test_footer_pops_preflight_notice_once(monkeypatch):
+    notices = ["Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"]
+
+    class FakeStore:
+        def pop_notice(self, session_id):
+            assert session_id == "sess-5"
+            return notices.pop(0) if notices else None
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("ineligible"),
+    )
+    monkeypatch.setattr(footer_hook, "AutoResetStateStore", FakeStore)
+
+    first = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-5"
+    )
+    second = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-5"
+    )
+
+    assert first is not None
+    assert first.count("Codex auto reset |") == 1
+    assert second is not None
+    assert "Codex auto reset |" not in second
+
+
+def test_footer_triggered_reset_adds_exactly_one_notice(monkeypatch):
+    notice = "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"
+    monkeypatch.setattr(
+        footer_hook,
+        "get_usage_for_model",
+        lambda _model: _codex_usage(remaining=0, credits=3),
+    )
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            "reset",
+            after_usage=_codex_usage(remaining=100, credits=2),
+            message=notice,
+        ),
+    )
+
+    result = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-6"
+    )
+
+    assert result is not None
+    assert result.count(notice) == 1
+
+
+def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+
+    def exploding_autoreset(**_kwargs):
+        raise RuntimeError("coordinator failed")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", exploding_autoreset)
+
+    result = footer_hook.append_usage_footer("reply", model="gpt-5-codex")
+
+    assert result == (
+        "reply\n\n───\n"
+        "Codex weekly | used 90%, left 10% | plan plus | reset credits 3"
+    )
+
+
+def test_manifest_declares_exactly_two_supported_hooks():
+    manifest = yaml.safe_load(Path("plugin/plugin.yaml").read_text())
+
+    assert manifest["provides_hooks"] == ["transform_llm_output", "pre_llm_call"]
+    assert "requires_env" not in manifest
 
 
 # --- Codex auth.json location (prefer Hermes' store, fall back to Codex CLI) ----
