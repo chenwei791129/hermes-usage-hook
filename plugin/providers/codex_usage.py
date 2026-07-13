@@ -42,9 +42,7 @@ from pathlib import Path
 import httpx
 
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-RESET_CREDITS_URL = (
-    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-)
+RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 CONSUME_RESET_CREDIT_URL = f"{RESET_CREDITS_URL}/consume"
 
 HTTP_TIMEOUT = 30.0
@@ -154,7 +152,7 @@ def _load_auth() -> dict:
 def _active_auth() -> tuple[str, str | None]:
     """Return the active access token and optional ChatGPT account identifier."""
     auth = _load_auth()
-    tokens = auth.get("tokens", {})
+    tokens = auth.get("tokens") or {}
     access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
     if not access_token:
         raise RuntimeError("auth.json has no usable access token")
@@ -248,9 +246,12 @@ def _normalize(raw: dict) -> dict:
             continue
         used = snap.get("used_percent", 0)
         reset_at = snap.get("reset_at")
+        # Clamp remaining into [0, 100]: an over-exhausted window can report
+        # used_percent > 100, and a negative remaining would otherwise be
+        # rejected by weekly_remaining() exactly when a reset is most needed.
         windows[_label_window(snap.get("limit_window_seconds", 0))] = {
             "used_percent": used,
-            "remaining_percent": 100 - used,
+            "remaining_percent": max(0, min(100, 100 - used)),
             "reset_at": reset_at,
             "reset_in_min": (
                 max(0, round((reset_at - time.time()) / 60)) if reset_at else None
@@ -280,13 +281,7 @@ def get_codex_usage() -> dict:
     inside a hook should wrap this in a try/except so a failure never breaks the
     agent — an expired token then just omits the footer.
     """
-    auth = _load_auth()
-    tokens = auth.get("tokens", {})
-    access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
-    if not access_token:
-        raise RuntimeError("auth.json has no usable access token")
-    account_id = tokens.get("account_id")
-
+    access_token, account_id = _active_auth()
     raw = _call_usage(access_token, account_id)
     return _normalize(raw)
 

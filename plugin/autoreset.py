@@ -78,9 +78,7 @@ def _plugin_autoreset(config: dict) -> dict:
     if auto_reset is None:
         return {}
     if not isinstance(auto_reset, dict):
-        raise ValueError(
-            f"plugins.entries.{PLUGIN_ID}.auto_reset must be a mapping"
-        )
+        raise ValueError(f"plugins.entries.{PLUGIN_ID}.auto_reset must be a mapping")
     return auto_reset
 
 
@@ -174,17 +172,11 @@ def is_eligible(*, model: str | None, usage: dict, config: AutoResetConfig) -> b
     """Evaluate pure Codex weekly reset eligibility without side effects."""
     if not config.valid or not config.enabled or not matches_codex_model(model):
         return False
-    if (
-        isinstance(config.threshold, bool)
-        or not isinstance(config.threshold, int)
-        or not 0 <= config.threshold <= 99
-    ):
-        return False
     remaining = weekly_remaining(usage)
     if remaining is None:
         return False
-    credit_count = usage.get("reset_credits_available")
-    if isinstance(credit_count, bool) or not isinstance(credit_count, int):
+    credit_count = _usage_credit_count(usage)
+    if credit_count is None:
         return False
     return credit_count > 0 and remaining <= config.threshold
 
@@ -369,9 +361,7 @@ class AutoResetStateStore:
         candidate = self.path.with_name(f"autoreset.corrupt.{stamp}.json")
         suffix = 1
         while candidate.exists():
-            candidate = self.path.with_name(
-                f"autoreset.corrupt.{stamp}.{suffix}.json"
-            )
+            candidate = self.path.with_name(f"autoreset.corrupt.{stamp}.{suffix}.json")
             suffix += 1
         os.replace(self.path, candidate)
         return candidate
@@ -595,13 +585,9 @@ def _try_create_lock(
         return False
     metadata_path = path / "owner.json"
     try:
-        descriptor = os.open(
-            metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
+        descriptor = os.open(metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                {"owner": owner, "pid": os.getpid(), "created_at": now}, handle
-            )
+            json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, handle)
             handle.flush()
             os.fsync(handle.fileno())
     except OSError:
@@ -637,9 +623,7 @@ def _reclaim_stale_lock(
             _remove_lock_dir(stale_path)
         except OSError:
             return False
-        return _try_create_lock(
-            path, owner, now, ignore_reclaim_guard=True
-        )
+        return _try_create_lock(path, owner, now, ignore_reclaim_guard=True)
     finally:
         try:
             guard_path.rmdir()
@@ -1021,7 +1005,9 @@ def maybe_autoreset(
 
             code = None
             if isinstance(response, dict):
-                code = response.get("code", response.get("status"))
+                # Coalesce so a JSON-null "code" still falls back to "status";
+                # dict.get's default only fires when the key is absent.
+                code = response.get("code") or response.get("status")
             if code in {"reset", "already_redeemed"}:
                 after_usage = None
                 after_remaining = None

@@ -31,6 +31,10 @@ import sys
 from ..autoreset import AutoResetStateStore, maybe_autoreset
 from ..usage import format_summary, get_usage_for_model
 
+# Coordinator statuses that do no filesystem work and never persist a notice, so
+# the footer can skip the locked notice-store reads entirely for these.
+_NO_NOTICE_STATUSES = frozenset({"disabled", "not_codex", "invalid_config"})
+
 
 def register(ctx):
     """Hermes plugin entry point."""
@@ -88,7 +92,11 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
             )
             if reset_result.after_usage is not None:
                 usage = reset_result.after_usage
-            notice = _pop_notice(session_id)
+            # Skip the locked notice-store reads when auto reset never ran: these
+            # states persist no notice, so polling would only add filesystem I/O
+            # to every reply for deployments that never enabled the feature.
+            if reset_result.status not in _NO_NOTICE_STATUSES:
+                notice = _pop_notice(session_id)
             if (
                 notice is None
                 and reset_result.status in {"reset", "already_redeemed"}
