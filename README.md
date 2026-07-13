@@ -39,14 +39,91 @@ Codex has no public usage API, so the hook reuses OAuth credentials from
 Hermes' credential store (`$HERMES_HOME/auth.json`, including both
 `providers.openai-codex` and `credential_pool.openai-codex` layouts) or, when
 run standalone, the Codex CLI store in `~/.codex/auth.json` (or
-`$CODEX_HOME/auth.json`). It queries the same internal endpoint the Codex CLI's
-`/status` uses. The hook only **reads** the access token — it never refreshes or
-writes back. Under Hermes the credential
-store is Hermes' own, and Hermes keeps the token fresh; if the token is expired
-the usage call fails and the footer is simply omitted.
+`$CODEX_HOME/auth.json`). It queries the same internal, unstable ChatGPT
+backend API that Codex tooling uses. The internal, unstable ChatGPT backend API
+can change without notice. The hook only **reads** the access token — it never
+refreshes or writes back. Under Hermes the credential store is Hermes' own, and
+Hermes keeps the token fresh; if the token is expired the usage call fails and
+the footer is simply omitted.
 
 > Codex's 5-hour window is an **account-wide** rolling quota, not a
 > per-conversation total — the same figure shown by the Codex CLI.
+
+### Codex auto reset
+
+Codex auto reset is disabled by default. When enabled, it can autonomously
+consume one Codex reset credit after the weekly remaining percentage reaches the
+configured threshold. That consumption is irreversible, so enabling
+`plugins.entries.hermes-usage-hook.auto_reset.enabled` is explicit standing
+authorization for autonomous reset-credit use.
+
+Canonical Hermes plugin config:
+
+```yaml
+plugins:
+  entries:
+    hermes-usage-hook:
+      auto_reset:
+        enabled: true
+        threshold: 0
+```
+
+Equivalent CLI configuration:
+
+```bash
+hermes config set plugins.entries.hermes-usage-hook.auto_reset.enabled true
+hermes config set plugins.entries.hermes-usage-hook.auto_reset.threshold 0
+```
+
+`plugins.entries.hermes-usage-hook.auto_reset.enabled` defaults to `false`.
+`plugins.entries.hermes-usage-hook.auto_reset.threshold` defaults to
+`threshold: 0`, uses weekly remaining semantics, and accepts only `0..99`.
+Eligibility is `weekly remaining <= threshold`; `100` is intentionally invalid
+because a freshly reset weekly window has 100% remaining and would qualify
+again.
+
+Optional environment overrides are available for process-managed deployments:
+`CODEX_ENABLE_AUTORESET` and `CODEX_AUTORESET_THRESHOLD`. Precedence is
+env → plugin config → defaults. Plugin config is read through Hermes
+`load_config()` on each hook invocation, so `config.yaml` edits can take effect
+without reinstalling the plugin. Process environment changes require a Gateway
+restart/reload.
+
+Hermes documents `plugins.entries.<plugin_id>` for plugin LLM trust
+configuration at
+`https://hermes-agent.nousresearch.com/docs/developer-guide/plugin-llm-access#trust-gate`.
+This plugin also reads its own `auto_reset.*` schema from the same plugin entry
+via `load_config()`; Hermes does not provide a generic plugin-config UI/schema
+for these values.
+
+OAuth credentials do not belong in plugin config. Keep ChatGPT OAuth state in
+Hermes' `auth.json` or the Codex CLI auth store. Auto-reset state lives under
+`$HERMES_HOME/state/hermes-usage-hook/autoreset.json`, with a lock directory at
+`$HERMES_HOME/state/hermes-usage-hook/autoreset.lock/`; it stores only
+non-sensitive identifiers, cooldowns, and audit values.
+
+The plugin ships dual hooks: `pre_llm_call` checks before the provider request
+so an already-exhausted weekly window can be reset before the model call, and
+`transform_llm_output` checks after a successful reply, refreshes usage after a
+reset, and appends a one-shot audit line. When auto reset is disabled, the
+pre-request hook makes no usage or credit API calls and injects no model
+context; the normal footer still works.
+
+Reset credit selection is idempotent: the coordinator chooses the
+earliest-expiring available credit, persists a redeem request ID before POST,
+and reuses that ID on ambiguous retries. Null expiries sort last. Missing
+credits, nothing-to-reset responses, deterministic failures, and unknown
+responses enter short cooldowns to avoid per-hook POST spam; transient GET
+failures use a shorter retry cooldown.
+
+After a successful reset, the footer includes an audit example like:
+
+```text
+Codex auto reset | weekly 0% → 100% | reset credits 3 → 2
+```
+
+Do not add auto-reset values or `requires_env` to `plugin/plugin.yaml`; the
+manifest only declares the supported hooks.
 
 ### MiniMax usage
 
@@ -64,12 +141,13 @@ tier, so the `| plan …` segment is omitted.
 
 | File | Purpose |
 | --- | --- |
-| `plugin/plugin.yaml` | Hermes plugin manifest: declares the plugin name, `kind: standalone`, and the `transform_llm_output` hook it provides, so Hermes discovery recognizes the directory. |
+| `plugin/plugin.yaml` | Hermes plugin manifest: declares the plugin name, `kind: standalone`, and exactly two hooks: `transform_llm_output` and `pre_llm_call`. |
 | `plugin/__init__.py` | Plugin root entry point: puts the plugin directory on `sys.path` and re-exports `register(ctx)` from the footer hook. |
 | `plugin/usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the summary. |
-| `plugin/providers/codex_usage.py` | Read `auth.json` (read-only), fetch and normalize Codex usage. |
+| `plugin/autoreset.py` | Codex auto-reset config, threshold policy, earliest-expiry credit selection, state, lock, cooldowns, idempotency, and one-shot notices. |
+| `plugin/providers/codex_usage.py` | Read `auth.json` (read-only), fetch and normalize Codex usage, list reset credits, and POST one idempotent reset-credit consume attempt. |
 | `plugin/providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
-| `plugin/hooks/footer_hook.py` | The Hermes hook that appends the provider's usage to each reply. |
+| `plugin/hooks/footer_hook.py` | The Hermes hook module that registers the footer and Codex preflight hooks, appends usage, and renders auto-reset audit notices. |
 
 ## Local development
 
@@ -222,6 +300,13 @@ install uses a non-default home.
   directory is installed and the manifest was found) and that it's in
   `plugins.enabled` in `~/.hermes/config.yaml`, then restart Hermes. Hook errors
   are logged to stderr, prefixed `[hermes-usage-hook]`.
+- **Auto reset never runs** — confirm
+  `plugins.entries.hermes-usage-hook.auto_reset.enabled` is true or
+  `CODEX_ENABLE_AUTORESET=true` is present in the Gateway process environment.
+  Keep `plugins.enabled` separate from the plugin's `auto_reset.*` settings.
+- **Auto reset waits after a failure** — cooldowns are intentional. They prevent
+  repeated consume attempts after no-credit, nothing-to-reset, transient, or
+  ambiguous backend responses.
 
 ## License
 

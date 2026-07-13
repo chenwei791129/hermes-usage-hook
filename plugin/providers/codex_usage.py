@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["httpx>=0.27"]
 # ///
-"""Fetch Codex (ChatGPT-backed) rate-limit usage.
+"""Fetch Codex (ChatGPT-backed) rate-limit usage and reset-credit APIs.
 
 Reads the Codex OAuth credentials from ``$HERMES_HOME/auth.json`` when running
 as a Hermes plugin (where Hermes keeps them under ``providers/openai-codex`` or
@@ -12,11 +12,18 @@ flat ``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; all
 layouts are supported. Queries the usage endpoint codexbar uses, returning a
 normalized view of the 5-hour and weekly rate-limit windows.
 
+The reset-credit list and consume helpers also call internal, unstable ChatGPT
+backend API endpoints. They are transport-only wrappers: the auto-reset
+coordinator owns opt-in config, earliest-expiry selection, cooldowns,
+idempotency, and persisted redeem request IDs. ``consume_rate_limit_reset_credit``
+therefore never generates IDs and never retries POSTs.
+
 This module never refreshes or writes back the token: the credential store may
 be Hermes' own live store, and rotating the refresh token out from under Hermes
 could break the deployment's login. It only reads the access token. If that
 token is expired, the usage call fails and the hook simply omits the footer
-(Hermes owns the token lifecycle and keeps it fresh).
+(Hermes owns the token lifecycle and keeps it fresh). OAuth credentials do not
+belong in plugin config or auto-reset state.
 
 Run standalone for a quick check:
 

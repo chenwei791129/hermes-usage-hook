@@ -526,6 +526,31 @@ def test_manifest_declares_exactly_two_supported_hooks():
     assert "requires_env" not in manifest
 
 
+def test_readme_documents_codex_autoreset_configuration():
+    readme = Path("README.md").read_text()
+    required = [
+        "plugins.entries.hermes-usage-hook.auto_reset.enabled",
+        "plugins.entries.hermes-usage-hook.auto_reset.threshold",
+        "CODEX_ENABLE_AUTORESET",
+        "CODEX_AUTORESET_THRESHOLD",
+        "disabled by default",
+        "threshold: 0",
+        "0..99",
+        "weekly remaining",
+        "irreversible",
+        "earliest-expiring",
+        "idempotent",
+        "internal, unstable ChatGPT backend API",
+        "OAuth credentials do not belong in plugin config",
+        "env → plugin config → defaults",
+        "plugins.entries.<plugin_id>",
+        "load_config()",
+        "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2",
+    ]
+    for needle in required:
+        assert needle in readme
+
+
 # --- Codex auth.json location (prefer Hermes' store, fall back to Codex CLI) ----
 
 
