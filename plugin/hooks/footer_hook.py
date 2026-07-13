@@ -55,7 +55,9 @@ def _pop_notice(session_id: str) -> str | None:
     if not session_id:
         return None
     try:
-        return AutoResetStateStore().pop_notice(session_id)
+        store = AutoResetStateStore()
+        notice = store.pop_notice(session_id)
+        return notice if notice is not None else store.pop_fallback_notice(session_id)
     except Exception as exc:  # noqa: BLE001 - footer must remain best-effort
         print(f"[hermes-usage-hook] auto reset notice skipped: {exc}", file=sys.stderr)
         return None

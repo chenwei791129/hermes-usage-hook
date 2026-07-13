@@ -478,6 +478,38 @@ def test_footer_pops_preflight_notice_once(monkeypatch):
     assert "Codex auto reset |" not in second
 
 
+def test_footer_drains_locked_fallback_notice_once(monkeypatch):
+    fallback = ["Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"]
+
+    class FakeStore:
+        def pop_notice(self, _session_id):
+            return None
+
+        def pop_fallback_notice(self, session_id):
+            assert session_id == "sess-fallback"
+            return fallback.pop(0) if fallback else None
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("cooldown"),
+    )
+    monkeypatch.setattr(footer_hook, "AutoResetStateStore", FakeStore)
+
+    first = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-fallback"
+    )
+    second = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-fallback"
+    )
+
+    assert first is not None
+    assert first.count("Codex auto reset |") == 1
+    assert second is not None
+    assert "Codex auto reset |" not in second
+
+
 def test_footer_triggered_reset_adds_exactly_one_notice(monkeypatch):
     notice = "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"
     monkeypatch.setattr(
@@ -597,6 +629,7 @@ def test_readme_documents_codex_autoreset_configuration():
         "autoreset-notices.json",
         "autoreset-notices.lock/",
         "five-minute suppression window",
+        "locked fallback notice",
         "env → plugin config → defaults",
         "plugins.entries.<plugin_id>",
         "load_config()",

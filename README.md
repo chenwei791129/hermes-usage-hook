@@ -101,8 +101,10 @@ Hermes' `auth.json` or the Codex CLI auth store. Pending attempts and cooldowns
 live in `$HERMES_HOME/state/hermes-usage-hook/autoreset.json`, protected by
 `autoreset.lock/`. One-shot audit notices use the separate
 `autoreset-notices.json` and `autoreset-notices.lock/`, so footer notice updates
-cannot overwrite consume idempotency state. These files store only non-sensitive
-identifiers, cooldowns, and audit values.
+cannot overwrite consume idempotency state. If that notice lock is busy after a
+successful preflight reset, a locked fallback notice is retained in
+`autoreset.json` until a footer drains it exactly once. These files store only
+non-sensitive identifiers, cooldowns, and audit values.
 
 The plugin ships dual hooks: `pre_llm_call` checks before the provider request
 so an already-exhausted weekly window can be reset before the model call, and

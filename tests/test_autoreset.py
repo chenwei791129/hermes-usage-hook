@@ -1200,6 +1200,37 @@ def test_success_queues_one_notice_for_session(tmp_path):
     assert store.pop_notice("sess-9", now=1_002.0) is None
 
 
+def test_success_uses_locked_fallback_notice_when_notice_lock_is_busy(
+    monkeypatch, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    monkeypatch.setattr(store, "queue_notice", lambda *_args, **_kwargs: False)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-fallback",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "reset"}),
+        uuid_factory=_Uuids("req-fallback"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "reset"
+    assert result.notice_persisted is True
+    message = store.pop_fallback_notice("sess-fallback", now=1_001.0)
+    assert message is not None
+    assert message.startswith("Codex auto reset")
+    assert store.pop_fallback_notice("sess-fallback", now=1_002.0) is None
+
+
 def test_hook_facing_api_never_raises(tmp_path):
     result = autoreset.maybe_autoreset(
         model="gpt-5-codex",

@@ -289,6 +289,27 @@ def _clean_state(state: dict) -> dict:
     if isinstance(cooldown_reason, str):
         cleaned["cooldown_reason"] = cooldown_reason
 
+    fallback_notices = state.get("fallback_notices")
+    cleaned_fallbacks = {}
+    if isinstance(fallback_notices, dict):
+        for session_id, notice in fallback_notices.items():
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            if not isinstance(notice, dict):
+                continue
+            message = notice.get("message")
+            created_at = notice.get("created_at")
+            if (
+                isinstance(message, str)
+                and isinstance(created_at, (int, float))
+                and not isinstance(created_at, bool)
+            ):
+                cleaned_fallbacks[session_id] = {
+                    "message": message,
+                    "created_at": created_at,
+                }
+    cleaned["fallback_notices"] = cleaned_fallbacks
+
     return cleaned
 
 
@@ -464,6 +485,49 @@ class AutoResetStateStore:
             notices = self._prune_notices(state, timestamp)
             notice = notices.pop(session_id, None)
             self._write_notices(state)
+            if notice is None:
+                return None
+            message = notice.get("message")
+            return message if isinstance(message, str) else None
+
+    @staticmethod
+    def _prune_fallback_notices(state: dict, now: float) -> dict:
+        notices = state.get("fallback_notices")
+        if not isinstance(notices, dict):
+            notices = {}
+        state["fallback_notices"] = {
+            session_id: notice
+            for session_id, notice in notices.items()
+            if isinstance(notice, dict)
+            and isinstance(notice.get("created_at"), (int, float))
+            and now - notice["created_at"] <= NOTICE_TTL_SECONDS
+        }
+        return state["fallback_notices"]
+
+    def queue_fallback_notice_locked(
+        self, state: dict, session_id: str, message: str, *, now: float
+    ) -> bool:
+        """Persist a notice while the caller holds the coordinator lock."""
+        if not session_id:
+            return False
+        notices = self._prune_fallback_notices(state, now)
+        notices[session_id] = {"message": message, "created_at": now}
+        self.write(state)
+        return True
+
+    def pop_fallback_notice(
+        self, session_id: str, *, now: float | None = None
+    ) -> str | None:
+        if not session_id:
+            return None
+        timestamp = self.clock() if now is None else now
+        with acquire_autoreset_lock(home=self.home, now=timestamp) as acquired:
+            if not acquired:
+                return None
+            state = self.load()
+            notices = self._prune_fallback_notices(state, timestamp)
+            notice = notices.pop(session_id, None)
+            self.write(state)
             if notice is None:
                 return None
             message = notice.get("message")
@@ -985,9 +1049,16 @@ def maybe_autoreset(
                     before_credits=before_credits,
                     after_credits=after_credits,
                 )
-                notice_persisted = state_store.queue_notice(
-                    session_id, message, now=now
-                )
+                try:
+                    notice_persisted = state_store.queue_notice(
+                        session_id, message, now=now
+                    )
+                except Exception:
+                    notice_persisted = False
+                if not notice_persisted:
+                    notice_persisted = state_store.queue_fallback_notice_locked(
+                        state, session_id, message, now=now
+                    )
                 return AutoResetResult(
                     code,
                     before_remaining=before_remaining,
