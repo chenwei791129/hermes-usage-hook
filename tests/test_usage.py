@@ -503,6 +503,30 @@ def test_footer_triggered_reset_adds_exactly_one_notice(monkeypatch):
     assert result.count(notice) == 1
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["invalid_config", "transient", "pending", "auth_or_validation_error"],
+)
+def test_footer_never_renders_non_success_autoreset_messages(monkeypatch, status):
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            status,
+            message="must not appear in the footer",
+        ),
+    )
+
+    result = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id=""
+    )
+
+    assert result is not None
+    assert "must not appear" not in result
+    assert "Codex auto reset |" not in result
+
+
 def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
     monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
 

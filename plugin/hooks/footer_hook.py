@@ -86,7 +86,12 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
             )
             if reset_result.after_usage is not None:
                 usage = reset_result.after_usage
-            notice = _pop_notice(session_id) or reset_result.message
+            notice = _pop_notice(session_id)
+            if (
+                notice is None
+                and reset_result.status in {"reset", "already_redeemed"}
+            ):
+                notice = reset_result.message
         except Exception as exc:  # noqa: BLE001 - preserve normal footer behavior
             print(f"[hermes-usage-hook] auto reset skipped: {exc}", file=sys.stderr)
         footer = format_summary(usage)
