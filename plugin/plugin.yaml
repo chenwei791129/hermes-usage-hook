@@ -5,3 +5,4 @@ author: Chen-Wei Sun
 kind: standalone
 provides_hooks:
   - transform_llm_output
+  - pre_llm_call

@@ -23,8 +23,12 @@ from .providers import codex_usage, minimax_usage
 _CODEX_PREFIXES = ("gpt-", "o1", "o3", "o4")
 
 
-def _matches_codex(model: str) -> bool:
-    return "codex" in model or model.startswith(_CODEX_PREFIXES)
+def matches_codex_model(model: str | None) -> bool:
+    """Return whether ``model`` is handled by the Codex usage provider."""
+    if not model:
+        return False
+    lowered = model.lower()
+    return "codex" in lowered or lowered.startswith(_CODEX_PREFIXES)
 
 
 def _matches_minimax(model: str) -> bool:
@@ -35,7 +39,7 @@ def _matches_minimax(model: str) -> bool:
 # on the module at call time so tests can monkeypatch them. Adding a provider is
 # one new module plus one line here.
 _REGISTRY = (
-    ("Codex", _matches_codex, lambda: codex_usage.get_codex_usage()),
+    ("Codex", matches_codex_model, lambda: codex_usage.get_codex_usage()),
     ("MiniMax", _matches_minimax, lambda: minimax_usage.get_minimax_usage()),
 )
 

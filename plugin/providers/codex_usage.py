@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["httpx>=0.27"]
 # ///
-"""Fetch Codex (ChatGPT-backed) rate-limit usage.
+"""Fetch Codex (ChatGPT-backed) rate-limit usage and reset-credit APIs.
 
 Reads the Codex OAuth credentials from ``$HERMES_HOME/auth.json`` when running
 as a Hermes plugin (where Hermes keeps them under ``providers/openai-codex`` or
@@ -12,11 +12,18 @@ flat ``$CODEX_HOME/auth.json`` / ``~/.codex/auth.json`` for standalone use; all
 layouts are supported. Queries the usage endpoint codexbar uses, returning a
 normalized view of the 5-hour and weekly rate-limit windows.
 
+The reset-credit list and consume helpers also call internal, unstable ChatGPT
+backend API endpoints. They are transport-only wrappers: the auto-reset
+coordinator owns opt-in config, earliest-expiry selection, cooldowns,
+idempotency, and persisted redeem request IDs. ``consume_rate_limit_reset_credit``
+therefore never generates IDs and never retries POSTs.
+
 This module never refreshes or writes back the token: the credential store may
 be Hermes' own live store, and rotating the refresh token out from under Hermes
 could break the deployment's login. It only reads the access token. If that
 token is expired, the usage call fails and the hook simply omits the footer
-(Hermes owns the token lifecycle and keeps it fresh).
+(Hermes owns the token lifecycle and keeps it fresh). OAuth credentials do not
+belong in plugin config or auto-reset state.
 
 Run standalone for a quick check:
 
@@ -35,6 +42,8 @@ from pathlib import Path
 import httpx
 
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+CONSUME_RESET_CREDIT_URL = f"{RESET_CREDITS_URL}/consume"
 
 HTTP_TIMEOUT = 30.0
 
@@ -140,7 +149,17 @@ def _load_auth() -> dict:
     return _codex_record(json.loads(_auth_path().read_text()))
 
 
-def _call_usage(access_token: str, account_id: str | None) -> dict:
+def _active_auth() -> tuple[str, str | None]:
+    """Return the active access token and optional ChatGPT account identifier."""
+    auth = _load_auth()
+    tokens = auth.get("tokens") or {}
+    access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
+    if not access_token:
+        raise RuntimeError("auth.json has no usable access token")
+    return access_token, tokens.get("account_id")
+
+
+def _auth_headers(access_token: str, account_id: str | None) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
@@ -148,10 +167,66 @@ def _call_usage(access_token: str, account_id: str | None) -> dict:
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
+    return headers
+
+
+def _request_json(
+    method: str,
+    url: str,
+    *,
+    access_token: str,
+    account_id: str | None,
+    payload: dict | None = None,
+) -> dict:
+    """Send one authenticated request and return a JSON object without retries."""
+    headers = _auth_headers(access_token, account_id)
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        resp = client.get(USAGE_URL, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        if payload is None:
+            response = client.request(method, url, headers=headers)
+        else:
+            response = client.request(method, url, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+    if not isinstance(result, dict):
+        raise RuntimeError("Codex backend returned a non-object JSON response")
+    return result
+
+
+def _call_usage(access_token: str, account_id: str | None) -> dict:
+    return _request_json(
+        "GET",
+        USAGE_URL,
+        access_token=access_token,
+        account_id=account_id,
+    )
+
+
+def list_rate_limit_reset_credits() -> dict:
+    """GET the detailed reset-credit collection using active Codex OAuth."""
+    access_token, account_id = _active_auth()
+    return _request_json(
+        "GET",
+        RESET_CREDITS_URL,
+        access_token=access_token,
+        account_id=account_id,
+    )
+
+
+def consume_rate_limit_reset_credit(
+    redeem_request_id: str, credit_id: str | None
+) -> dict:
+    """POST one idempotent consume attempt; never generate or retry IDs here."""
+    access_token, account_id = _active_auth()
+    payload = {"redeem_request_id": redeem_request_id}
+    if credit_id is not None:
+        payload["credit_id"] = credit_id
+    return _request_json(
+        "POST",
+        CONSUME_RESET_CREDIT_URL,
+        access_token=access_token,
+        account_id=account_id,
+        payload=payload,
+    )
 
 
 def _label_window(seconds: int) -> str:
@@ -171,9 +246,12 @@ def _normalize(raw: dict) -> dict:
             continue
         used = snap.get("used_percent", 0)
         reset_at = snap.get("reset_at")
+        # Clamp remaining into [0, 100]: an over-exhausted window can report
+        # used_percent > 100, and a negative remaining would otherwise be
+        # rejected by weekly_remaining() exactly when a reset is most needed.
         windows[_label_window(snap.get("limit_window_seconds", 0))] = {
             "used_percent": used,
-            "remaining_percent": 100 - used,
+            "remaining_percent": max(0, min(100, 100 - used)),
             "reset_at": reset_at,
             "reset_in_min": (
                 max(0, round((reset_at - time.time()) / 60)) if reset_at else None
@@ -203,13 +281,7 @@ def get_codex_usage() -> dict:
     inside a hook should wrap this in a try/except so a failure never breaks the
     agent — an expired token then just omits the footer.
     """
-    auth = _load_auth()
-    tokens = auth.get("tokens", {})
-    access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
-    if not access_token:
-        raise RuntimeError("auth.json has no usable access token")
-    account_id = tokens.get("account_id")
-
+    access_token, account_id = _active_auth()
     raw = _call_usage(access_token, account_id)
     return _normalize(raw)
 

@@ -9,12 +9,16 @@ are importable as a package:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
 
+import httpx
 import pytest
+import yaml
 
+from plugin import autoreset
 from plugin import usage
 from plugin.hooks import footer_hook
 from plugin.providers import codex_usage, minimax_usage
@@ -142,6 +146,19 @@ def test_minimax_normalize_rejects_missing_general():
 )
 def test_match_provider_mapping(model, expected):
     assert usage._match_provider(model) == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("GPT-5-CODEX", True),
+        ("o4-mini", True),
+        ("claude-opus-4", False),
+        (None, False),
+    ],
+)
+def test_matches_codex_model_is_public_and_case_insensitive(model, expected):
+    assert usage.matches_codex_model(model) is expected
 
 
 def test_get_usage_for_model_dispatches_to_matched_provider(monkeypatch):
@@ -296,6 +313,330 @@ def test_footer_logs_prefixed_error_and_leaves_reply_unchanged(monkeypatch, caps
     # Returning None tells Hermes to keep the reply unchanged.
     assert result is None
     assert "[hermes-usage-hook]" in capsys.readouterr().err
+
+
+# --- Hook registration and Codex auto-reset integration -----------------------
+
+
+class _HookContext:
+    def __init__(self):
+        self.calls = []
+
+    def register_hook(self, hook_name, callback):
+        self.calls.append((hook_name, callback))
+
+
+def _codex_usage(*, remaining=10, credits=3):
+    return {
+        "provider": "Codex",
+        "plan_type": "plus",
+        "reset_credits_available": credits,
+        "windows": {
+            "weekly": {
+                "used_percent": 100 - remaining,
+                "remaining_percent": remaining,
+            }
+        },
+    }
+
+
+def test_register_adds_transform_and_pre_llm_hooks_exactly_once():
+    ctx = _HookContext()
+
+    footer_hook.register(ctx)
+
+    assert ctx.calls == [
+        ("transform_llm_output", footer_hook.append_usage_footer),
+        ("pre_llm_call", footer_hook.codex_autoreset_preflight),
+    ]
+
+
+def test_preflight_disabled_returns_none_without_network(monkeypatch):
+    calls = []
+
+    def fake_autoreset(**kwargs):
+        calls.append(kwargs)
+        return autoreset.AutoResetResult("disabled")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    result = footer_hook.codex_autoreset_preflight(
+        model="gpt-5-codex",
+        session_id="sess-1",
+        turn_id="turn-1",
+    )
+
+    assert result is None
+    assert len(calls) == 1
+
+
+def test_preflight_is_synchronous_and_never_injects_prompt_context(monkeypatch):
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("disabled"),
+    )
+
+    assert not inspect.iscoroutinefunction(footer_hook.codex_autoreset_preflight)
+    assert footer_hook.codex_autoreset_preflight(model="gpt-5-codex") is None
+
+
+def test_preflight_passes_session_turn_and_model(monkeypatch):
+    captured = {}
+
+    def fake_autoreset(**kwargs):
+        captured.update(kwargs)
+        return autoreset.AutoResetResult("disabled")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    footer_hook.codex_autoreset_preflight(
+        model="gpt-5-codex",
+        session_id="sess-2",
+        turn_id="turn-2",
+    )
+
+    assert captured == {
+        "model": "gpt-5-codex",
+        "session_id": "sess-2",
+        "turn_id": "turn-2",
+    }
+
+
+def test_footer_passes_existing_usage_to_coordinator(monkeypatch):
+    existing_usage = _codex_usage(remaining=50, credits=3)
+    captured = {}
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: existing_usage)
+
+    def fake_autoreset(**kwargs):
+        captured.update(kwargs)
+        return autoreset.AutoResetResult("ineligible")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-3"
+    )
+
+    assert captured["usage"] is existing_usage
+    assert captured["model"] == "gpt-5-codex"
+    assert captured["session_id"] == "sess-3"
+
+
+def test_footer_uses_refreshed_usage_after_reset(monkeypatch):
+    monkeypatch.setattr(
+        footer_hook,
+        "get_usage_for_model",
+        lambda _model: _codex_usage(remaining=0, credits=3),
+    )
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            "reset",
+            after_usage=_codex_usage(remaining=100, credits=2),
+            message="Codex auto reset | weekly 0% → 100% | reset credits 3 → 2",
+        ),
+    )
+
+    result = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-4"
+    )
+
+    assert result is not None
+    assert "Codex weekly | used 0%, left 100% | plan plus | reset credits 2" in result
+    assert "Codex weekly | used 100%, left 0% | plan plus | reset credits 3" not in result
+
+
+def test_footer_pops_preflight_notice_once(monkeypatch):
+    notices = ["Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"]
+
+    class FakeStore:
+        def pop_notice(self, session_id):
+            assert session_id == "sess-5"
+            return notices.pop(0) if notices else None
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("ineligible"),
+    )
+    monkeypatch.setattr(footer_hook, "AutoResetStateStore", FakeStore)
+
+    first = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-5"
+    )
+    second = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-5"
+    )
+
+    assert first is not None
+    assert first.count("Codex auto reset |") == 1
+    assert second is not None
+    assert "Codex auto reset |" not in second
+
+
+def test_footer_drains_locked_fallback_notice_once(monkeypatch):
+    fallback = ["Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"]
+
+    class FakeStore:
+        def pop_notice(self, _session_id):
+            return None
+
+        def pop_fallback_notice(self, session_id):
+            assert session_id == "sess-fallback"
+            return fallback.pop(0) if fallback else None
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("cooldown"),
+    )
+    monkeypatch.setattr(footer_hook, "AutoResetStateStore", FakeStore)
+
+    first = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-fallback"
+    )
+    second = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-fallback"
+    )
+
+    assert first is not None
+    assert first.count("Codex auto reset |") == 1
+    assert second is not None
+    assert "Codex auto reset |" not in second
+
+
+def test_footer_triggered_reset_adds_exactly_one_notice(monkeypatch):
+    notice = "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"
+    monkeypatch.setattr(
+        footer_hook,
+        "get_usage_for_model",
+        lambda _model: _codex_usage(remaining=0, credits=3),
+    )
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            "reset",
+            after_usage=_codex_usage(remaining=100, credits=2),
+            message=notice,
+        ),
+    )
+
+    result = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-6"
+    )
+
+    assert result is not None
+    assert result.count(notice) == 1
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["invalid_config", "transient", "pending", "auth_or_validation_error"],
+)
+def test_footer_never_renders_non_success_autoreset_messages(monkeypatch, status):
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            status,
+            message="must not appear in the footer",
+        ),
+    )
+
+    result = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id=""
+    )
+
+    assert result is not None
+    assert "must not appear" not in result
+    assert "Codex auto reset |" not in result
+
+
+def test_persisted_notice_pop_failure_never_uses_duplicate_message_fallback(monkeypatch):
+    notice = "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"
+    pops = [None, notice]
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(footer_hook, "_pop_notice", lambda _session_id: pops.pop(0))
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult(
+            "reset",
+            message=notice,
+            notice_persisted=True,
+        ),
+    )
+
+    first = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-lock"
+    )
+    second = footer_hook.append_usage_footer(
+        "reply", model="gpt-5-codex", session_id="sess-lock"
+    )
+
+    assert first is not None
+    assert notice not in first
+    assert second is not None
+    assert second.count(notice) == 1
+
+
+def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+
+    def exploding_autoreset(**_kwargs):
+        raise RuntimeError("coordinator failed")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", exploding_autoreset)
+
+    result = footer_hook.append_usage_footer("reply", model="gpt-5-codex")
+
+    assert result == (
+        "reply\n\n───\n"
+        "Codex weekly | used 90%, left 10% | plan plus | reset credits 3"
+    )
+
+
+def test_manifest_declares_exactly_two_supported_hooks():
+    manifest = yaml.safe_load(Path("plugin/plugin.yaml").read_text())
+
+    assert manifest["provides_hooks"] == ["transform_llm_output", "pre_llm_call"]
+    assert "requires_env" not in manifest
+
+
+def test_readme_documents_codex_autoreset_configuration():
+    readme = Path("README.md").read_text()
+    required = [
+        "plugins.entries.hermes-usage-hook.auto_reset.enabled",
+        "plugins.entries.hermes-usage-hook.auto_reset.threshold",
+        "CODEX_ENABLE_AUTORESET",
+        "CODEX_AUTORESET_THRESHOLD",
+        "disabled by default",
+        "threshold: 0",
+        "0..99",
+        "weekly remaining",
+        "irreversible",
+        "earliest-expiring",
+        "idempotent",
+        "internal, unstable ChatGPT backend API",
+        "OAuth credentials do not belong in plugin config",
+        "autoreset-notices.json",
+        "autoreset-notices.lock/",
+        "five-minute suppression window",
+        "same coordinator-locked atomic write",
+        "env → plugin config → defaults",
+        "plugins.entries.<plugin_id>",
+        "load_config()",
+        "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2",
+    ]
+    for needle in required:
+        assert needle in readme
 
 
 # --- Codex auth.json location (prefer Hermes' store, fall back to Codex CLI) ----
@@ -600,3 +941,148 @@ def test_get_codex_usage_reads_credential_pool_layout(monkeypatch, tmp_path):
     }
     assert usage["provider"] == "Codex"
     assert usage["windows"]["5h"]["used_percent"] == 34
+
+
+# --- Codex rate-limit reset credit transport (offline only) -------------------
+
+
+def _mock_codex_transport(monkeypatch, handler, *, account_id="account-123"):
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        codex_usage,
+        "_load_auth",
+        lambda: {
+            "tokens": {
+                "access_token": "secret-access-token",
+                "account_id": account_id,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        codex_usage.httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(handler), **kwargs
+        ),
+    )
+
+
+def test_list_reset_credits_uses_get_endpoint_and_active_auth(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"available_count": 2})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    assert codex_usage.list_rate_limit_reset_credits() == {"available_count": 2}
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert str(requests[0].url) == codex_usage.RESET_CREDITS_URL
+    assert requests[0].headers["Authorization"] == "Bearer secret-access-token"
+
+
+def test_consume_reset_credit_posts_stable_identifiers(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"status": "reset"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    result = codex_usage.consume_rate_limit_reset_credit("request-uuid", "credit-1")
+
+    assert result == {"status": "reset"}
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == codex_usage.CONSUME_RESET_CREDIT_URL
+    assert json.loads(requests[0].content) == {
+        "redeem_request_id": "request-uuid",
+        "credit_id": "credit-1",
+    }
+
+
+def test_consume_omits_credit_id_only_when_none(monkeypatch):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"status": "reset"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    codex_usage.consume_rate_limit_reset_credit("request-without-credit", None)
+    codex_usage.consume_rate_limit_reset_credit("request-with-empty-credit", "")
+
+    assert bodies == [
+        {"redeem_request_id": "request-without-credit"},
+        {"redeem_request_id": "request-with-empty-credit", "credit_id": ""},
+    ]
+
+
+@pytest.mark.parametrize("operation", ["list", "consume"])
+def test_reset_transport_sends_chatgpt_account_header_when_present(
+    monkeypatch, operation
+):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    _mock_codex_transport(monkeypatch, handler, account_id="active-account")
+
+    if operation == "list":
+        codex_usage.list_rate_limit_reset_credits()
+    else:
+        codex_usage.consume_rate_limit_reset_credit("request-uuid", "credit-1")
+
+    assert requests[0].headers["ChatGPT-Account-Id"] == "active-account"
+
+
+@pytest.mark.parametrize("status_code", [401, 429, 500, 503])
+@pytest.mark.parametrize("operation", ["list", "consume"])
+def test_reset_transport_raises_on_401_429_and_5xx(
+    monkeypatch, status_code, operation
+):
+    def handler(request):
+        return httpx.Response(status_code, json={"error": "rejected"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        if operation == "list":
+            codex_usage.list_rate_limit_reset_credits()
+        else:
+            codex_usage.consume_rate_limit_reset_credit("request-uuid", "credit-1")
+
+
+def test_reset_transport_does_not_retry_post(monkeypatch):
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, json={"error": "try later"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        codex_usage.consume_rate_limit_reset_credit("stable-uuid", "credit-1")
+
+    assert calls == 1
+
+
+def test_provider_errors_do_not_include_bearer_token(monkeypatch):
+    def handler(request):
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        codex_usage.list_rate_limit_reset_credits()
+
+    assert "secret-access-token" not in str(exc_info.value)
+    assert "Bearer" not in str(exc_info.value)
