@@ -85,6 +85,7 @@ Consume reuses the active Codex credential and existing bounded timeout. Generic
 - Atomic lock directory: `$HERMES_HOME/state/hermes-usage-hook/autoreset.lock/`, acquired via `os.mkdir` without a dependency.
 - Lock metadata contains PID and acquisition time only. A lock older than 120 seconds may be reclaimed once; reclaim failure stays fail closed.
 - State path: `$HERMES_HOME/state/hermes-usage-hook/autoreset.json`, written by temp file plus `os.replace`, with owner-only permissions where supported.
+- One-shot audit notices live in a separate `autoreset-notices.json` protected by `autoreset-notices.lock/`; notice queue/pop operations cannot overwrite pending consume state.
 - Pending state contains request UUID, credit ID, timestamps, and status—never credentials.
 - Timeout/connection loss after POST keeps pending state. The next invocation reuses the same UUID and credit ID.
 - `reset` and `already_redeemed` are successful terminal outcomes. `no_credit` and `nothing_to_reset` are non-success terminal outcomes.

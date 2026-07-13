@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import httpx
+
 from .providers.codex_usage import (
     consume_rate_limit_reset_credit,
     list_rate_limit_reset_credits,
@@ -287,6 +289,11 @@ def _clean_state(state: dict) -> dict:
     if isinstance(cooldown_reason, str):
         cleaned["cooldown_reason"] = cooldown_reason
 
+    return cleaned
+
+
+def _clean_notices(state: dict) -> dict:
+    cleaned: dict = {"version": STATE_VERSION}
     notices = state.get("notices")
     clean_notices = {}
     if isinstance(notices, dict):
@@ -321,12 +328,20 @@ class AutoResetStateStore:
     ) -> None:
         self.home = Path(home) if home is not None else _hermes_home()
         self.path = self.home / "state" / PLUGIN_ID / "autoreset.json"
+        self.notices_path = self.home / "state" / PLUGIN_ID / "autoreset-notices.json"
         self.lock_path = self.home / "state" / PLUGIN_ID / "autoreset.lock"
+        self.notices_lock_path = (
+            self.home / "state" / PLUGIN_ID / "autoreset-notices.lock"
+        )
         self.clock = clock
 
     @staticmethod
     def empty() -> dict:
-        return {"version": STATE_VERSION, "pending": None, "notices": {}}
+        return {"version": STATE_VERSION, "pending": None}
+
+    @staticmethod
+    def empty_notices() -> dict:
+        return {"version": STATE_VERSION, "notices": {}}
 
     def _quarantine(self) -> Path:
         stamp = int(self.clock())
@@ -357,11 +372,10 @@ class AutoResetStateStore:
             ) from exc
         return _clean_state(loaded)
 
-    def write(self, state: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        cleaned = _clean_state(state)
+    def _write_json(self, path: Path, state: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temp_name = tempfile.mkstemp(
-            prefix=".autoreset.", suffix=".tmp", dir=self.path.parent
+            prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent
         )
         temp_path = Path(temp_name)
         try:
@@ -370,12 +384,12 @@ class AutoResetStateStore:
             except (AttributeError, OSError):
                 pass
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(cleaned, handle, sort_keys=True, separators=(",", ":"))
+                json.dump(state, handle, sort_keys=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, self.path)
+            os.replace(temp_path, path)
             try:
-                self.path.chmod(0o600)
+                path.chmod(0o600)
             except OSError:
                 pass
         finally:
@@ -383,6 +397,23 @@ class AutoResetStateStore:
                 temp_path.unlink()
             except FileNotFoundError:
                 pass
+
+    def write(self, state: dict) -> None:
+        self._write_json(self.path, _clean_state(state))
+
+    def _load_notices(self) -> dict:
+        if not self.notices_path.exists():
+            return self.empty_notices()
+        try:
+            loaded = json.loads(self.notices_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict) or loaded.get("version") != STATE_VERSION:
+                raise ValueError("unsupported or malformed auto-reset notices")
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            return self.empty_notices()
+        return _clean_notices(loaded)
+
+    def _write_notices(self, state: dict) -> None:
+        self._write_json(self.notices_path, _clean_notices(state))
 
     @staticmethod
     def cooldown_active(state: dict, *, now: float) -> bool:
@@ -413,24 +444,30 @@ class AutoResetStateStore:
         if not session_id:
             return False
         timestamp = self.clock() if now is None else now
-        state = self.load()
-        notices = self._prune_notices(state, timestamp)
-        notices[session_id] = {"message": message, "created_at": timestamp}
-        self.write(state)
-        return True
+        with acquire_notice_lock(home=self.home, now=timestamp) as acquired:
+            if not acquired:
+                return False
+            state = self._load_notices()
+            notices = self._prune_notices(state, timestamp)
+            notices[session_id] = {"message": message, "created_at": timestamp}
+            self._write_notices(state)
+            return True
 
     def pop_notice(self, session_id: str, *, now: float | None = None) -> str | None:
         if not session_id:
             return None
         timestamp = self.clock() if now is None else now
-        state = self.load()
-        notices = self._prune_notices(state, timestamp)
-        notice = notices.pop(session_id, None)
-        if notice is None:
-            return None
-        self.write(state)
-        message = notice.get("message")
-        return message if isinstance(message, str) else None
+        with acquire_notice_lock(home=self.home, now=timestamp) as acquired:
+            if not acquired:
+                return None
+            state = self._load_notices()
+            notices = self._prune_notices(state, timestamp)
+            notice = notices.pop(session_id, None)
+            self._write_notices(state)
+            if notice is None:
+                return None
+            message = notice.get("message")
+            return message if isinstance(message, str) else None
 
 
 def _lock_metadata(path: Path) -> dict:
@@ -520,8 +557,30 @@ def acquire_autoreset_lock(
             _release_owned_lock(path, owner)
 
 
+@contextmanager
+def acquire_notice_lock(
+    *, home: Path | None = None, now: float | None = None
+) -> Iterator[bool]:
+    """Acquire the notice-file lock without touching the coordinator lock."""
+    lock_home = Path(home) if home is not None else _hermes_home()
+    path = lock_home / "state" / PLUGIN_ID / "autoreset-notices.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.time() if now is None else now
+    owner = str(uuid4())
+    acquired = _try_create_lock(path, owner, timestamp)
+    if not acquired and _lock_is_stale(path, timestamp):
+        if _reclaim_stale_lock(path, owner):
+            acquired = _try_create_lock(path, owner, timestamp)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            _release_owned_lock(path, owner)
+
+
 COOLDOWN_RETRY_SECONDS = 60.0
 COOLDOWN_EXHAUSTED_SECONDS = 5 * 60.0
+TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429})
 
 
 @dataclass(frozen=True)
@@ -554,6 +613,13 @@ def _set_cooldown(
 def _clear_cooldown(state: dict) -> None:
     state.pop("cooldown_until", None)
     state.pop("cooldown_reason", None)
+
+
+def _is_deterministic_auth_or_validation_error(exc: Exception) -> bool:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    status_code = exc.response.status_code
+    return 400 <= status_code < 500 and status_code not in TRANSIENT_HTTP_STATUS_CODES
 
 
 def _pending_record(state: dict) -> dict | None:
@@ -627,9 +693,25 @@ def maybe_autoreset(
 
         initial_usage = usage
         if initial_usage is None:
+            now = clock()
             try:
                 initial_usage = fetch_usage()
             except Exception as exc:
+                make_lock = lock_factory or (
+                    lambda: acquire_autoreset_lock(home=state_store.home, now=now)
+                )
+                with make_lock() as acquired:
+                    if not acquired:
+                        return AutoResetResult("busy", message=str(exc))
+                    state = state_store.load()
+                    _set_cooldown(
+                        state,
+                        now=now,
+                        seconds=COOLDOWN_RETRY_SECONDS,
+                        reason="transient",
+                        clear_pending=False,
+                    )
+                    state_store.write(state)
                 return AutoResetResult("transient", message=str(exc))
         if not isinstance(initial_usage, dict):
             return AutoResetResult("ineligible")
@@ -703,31 +785,7 @@ def maybe_autoreset(
                 return AutoResetResult("ineligible")
             live_remaining = weekly_remaining(live_usage)
             live_credits = _usage_credit_count(live_usage)
-            if pending is not None and live_remaining is not None:
-                if live_remaining > effective.threshold:
-                    before_remaining = pending.get("before_remaining")
-                    before_credits = pending.get("before_credits")
-                    state["pending"] = None
-                    _clear_cooldown(state)
-                    state_store.write(state)
-                    message = _notice_message(
-                        status="reset",
-                        before_remaining=before_remaining,
-                        after_remaining=live_remaining,
-                        before_credits=before_credits,
-                        after_credits=live_credits,
-                    )
-                    state_store.queue_notice(session_id, message, now=now)
-                    return AutoResetResult(
-                        "reset",
-                        before_remaining=before_remaining,
-                        after_remaining=live_remaining,
-                        before_credits=before_credits,
-                        after_credits=live_credits,
-                        after_usage=live_usage,
-                        message=message,
-                    )
-            elif pending is not None or not is_eligible(
+            if pending is None and not is_eligible(
                 model=model, usage=live_usage, config=effective
             ):
                 return AutoResetResult(
@@ -794,6 +852,21 @@ def maybe_autoreset(
             try:
                 response = consume(request_id, credit_id)
             except Exception as exc:
+                if _is_deterministic_auth_or_validation_error(exc):
+                    _set_cooldown(
+                        state,
+                        now=now,
+                        seconds=COOLDOWN_EXHAUSTED_SECONDS,
+                        reason="auth_or_validation_error",
+                        clear_pending=True,
+                    )
+                    state_store.write(state)
+                    return AutoResetResult(
+                        "auth_or_validation_error",
+                        before_remaining=before_remaining,
+                        before_credits=before_credits,
+                        message=str(exc),
+                    )
                 pending["updated_at"] = now
                 pending["retry_after"] = now + COOLDOWN_RETRY_SECONDS
                 pending["status"] = "pending"

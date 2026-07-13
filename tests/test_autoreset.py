@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
+import httpx
 import pytest
 
 from plugin import autoreset
@@ -443,6 +444,22 @@ def test_empty_session_id_never_leaks_notice_across_sessions(tmp_path):
     assert store.pop_notice("another-session", now=1_001.0) is None
 
 
+def test_notice_stale_snapshot_write_cannot_clobber_pending_state(
+    monkeypatch, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    store.write({"pending": _pending_attempt()})
+    stale_state = autoreset.AutoResetStateStore.empty()
+
+    monkeypatch.setattr(store, "load", lambda: stale_state)
+
+    assert store.queue_notice("session-a", "reset complete", now=1_000.0)
+
+    pending = autoreset.AutoResetStateStore(home=tmp_path).load()["pending"]
+    assert pending is not None
+    assert pending["redeem_request_id"] == "request-uuid"
+
+
 # --- Synchronous coordinator with stable retry identity -----------------------
 
 
@@ -723,30 +740,54 @@ def test_future_retry_after_blocks_without_new_uuid_or_post(tmp_path):
     assert pending["credit_id"] == "credit-1"
 
 
-def test_remote_timeout_success_is_reconciled_and_does_not_block_later_reset(
-    tmp_path,
-):
+def test_due_pending_retries_exact_ids_even_when_live_usage_above_threshold(tmp_path):
     store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
     _seed_pending(store, retry_after=900.0)
+    consumer = _Consumer(response={"status": "already_redeemed"})
 
-    reconciled = autoreset.maybe_autoreset(
+    result = autoreset.maybe_autoreset(
         model="gpt-5-codex",
         usage=_eligible_usage(remaining=100, credits=1),
-        session_id="sess-reconcile",
+        session_id="sess-retry",
         config=_enabled_config(threshold=10),
         store=store,
-        usage_fetcher=_Fetcher(_eligible_usage(remaining=100, credits=1)),
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=100, credits=1),
+            _eligible_usage(remaining=100, credits=1),
+        ),
         credit_lister=_never,
-        consumer=_never,
+        consumer=consumer,
         uuid_factory=_never,
         lock_factory=_LockFactory(True),
         clock=lambda: 1_000.0,
     )
 
-    assert reconciled.status == "reset"
-    assert reconciled.after_remaining == 100
+    assert result.status == "already_redeemed"
+    assert consumer.calls == [("req-1", "credit-1")]
     assert store.load()["pending"] is None
-    assert store.pop_notice("sess-reconcile", now=1_001.0) is not None
+
+
+def test_fresh_attempt_waits_until_terminal_response_clears_pending(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store, retry_after=900.0)
+    first_consumer = _Consumer(response={"status": "already_redeemed"})
+
+    first = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=100, credits=1),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=100, credits=1),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_never,
+        consumer=first_consumer,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+    assert first.status == "already_redeemed"
 
     consumer = _Consumer(response={"status": "reset"})
     later = autoreset.maybe_autoreset(
@@ -897,6 +938,122 @@ def test_transient_get_failure_sets_one_minute_cooldown(tmp_path):
     state = store.load()
     assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
     assert state["cooldown_reason"] == "transient"
+
+
+def test_initial_usage_fetch_failure_sets_one_minute_cooldown_and_preserves_state(
+    tmp_path,
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    store.queue_notice("sess-earlier", "earlier notice", now=990.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=None,
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(ConnectionError("usage endpoint unreachable")),
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "transient"
+    state = store.load()
+    assert state["pending"] is None
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
+    assert state["cooldown_reason"] == "transient"
+    assert store.pop_notice("sess-earlier", now=1_001.0) == "earlier notice"
+
+
+def _http_status_error(status_code):
+    request = httpx.Request("POST", "https://chatgpt.com/backend-api/test")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError("backend rejected request", request=request, response=response)
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+def test_consume_deterministic_4xx_clears_pending_and_sets_five_minute_cooldown(
+    status_code, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store, retry_after=900.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_never,
+        consumer=_Consumer(error=_http_status_error(status_code)),
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "auth_or_validation_error"
+    state = store.load()
+    assert state["pending"] is None
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_EXHAUSTED_SECONDS
+    assert state["cooldown_reason"] == "auth_or_validation_error"
+
+
+@pytest.mark.parametrize("status_code", [408, 409, 425, 429])
+def test_consume_transient_4xx_preserves_pending_for_one_minute(status_code, tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store, retry_after=900.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_never,
+        consumer=_Consumer(error=_http_status_error(status_code)),
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "pending"
+    pending = store.load()["pending"]
+    assert pending["redeem_request_id"] == "req-1"
+    assert pending["credit_id"] == "credit-1"
+    assert pending["retry_after"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.TimeoutException("timed out"),
+        httpx.TransportError("connection lost"),
+    ],
+)
+def test_consume_ambiguous_transport_exceptions_preserve_pending_ids(error, tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store, retry_after=900.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_never,
+        consumer=_Consumer(error=error),
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "pending"
+    pending = store.load()["pending"]
+    assert pending["redeem_request_id"] == "req-1"
+    assert pending["credit_id"] == "credit-1"
+    assert pending["retry_after"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
 
 
 def test_unknown_or_malformed_response_fails_closed(tmp_path):

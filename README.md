@@ -97,10 +97,12 @@ via `load_config()`; Hermes does not provide a generic plugin-config UI/schema
 for these values.
 
 OAuth credentials do not belong in plugin config. Keep ChatGPT OAuth state in
-Hermes' `auth.json` or the Codex CLI auth store. Auto-reset state lives under
-`$HERMES_HOME/state/hermes-usage-hook/autoreset.json`, with a lock directory at
-`$HERMES_HOME/state/hermes-usage-hook/autoreset.lock/`; it stores only
-non-sensitive identifiers, cooldowns, and audit values.
+Hermes' `auth.json` or the Codex CLI auth store. Pending attempts and cooldowns
+live in `$HERMES_HOME/state/hermes-usage-hook/autoreset.json`, protected by
+`autoreset.lock/`. One-shot audit notices use the separate
+`autoreset-notices.json` and `autoreset-notices.lock/`, so footer notice updates
+cannot overwrite consume idempotency state. These files store only non-sensitive
+identifiers, cooldowns, and audit values.
 
 The plugin ships dual hooks: `pre_llm_call` checks before the provider request
 so an already-exhausted weekly window can be reset before the model call, and

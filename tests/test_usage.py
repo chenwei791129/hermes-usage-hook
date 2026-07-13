@@ -542,6 +542,8 @@ def test_readme_documents_codex_autoreset_configuration():
         "idempotent",
         "internal, unstable ChatGPT backend API",
         "OAuth credentials do not belong in plugin config",
+        "autoreset-notices.json",
+        "autoreset-notices.lock/",
         "env → plugin config → defaults",
         "plugins.entries.<plugin_id>",
         "load_config()",
