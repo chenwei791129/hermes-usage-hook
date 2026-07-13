@@ -181,7 +181,7 @@ def test_reset_transport_does_not_retry_post(): ...
 def test_provider_errors_do_not_include_bearer_token(): ...
 ```
 
-Use a fake `httpx.Client`/`MockTransport`; never read the real `auth.json` and never call `chatgpt.com` in tests.
+Use a fake `httpx.Client`/`MockTransport`; never read the real `auth.json` and never call the live Codex backend in tests.
 
 - [ ] **3.2 Run the focused tests and verify RED.**
 
@@ -194,9 +194,9 @@ uv run pytest tests/test_usage.py -k "reset_credit or consume" -v
 Add constants:
 
 ```python
-RESET_CREDITS_URL = (
-    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-)
+# Use the real Codex reset-credit base URL here (kept out of this artifact;
+# see plugin/providers/codex_usage.py for the concrete value).
+RESET_CREDITS_URL = "<codex-backend>/reset-credits"
 CONSUME_RESET_CREDIT_URL = f"{RESET_CREDITS_URL}/consume"
 ```
 

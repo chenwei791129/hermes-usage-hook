@@ -8,7 +8,7 @@ Codex 現在提供 banked rate-limit reset credits，且 ChatGPT backend API 支
 - 保留 `CODEX_ENABLE_AUTORESET` 與 `CODEX_AUTORESET_THRESHOLD` 作為部署環境 override；優先順序為 env → plugin config → defaults。啟用值為 true 視為使用者對 plugin 自動消耗 Codex reset credit 的持續授權。
 - 同時在 `pre_llm_call` 與既有 footer 流程檢查：模型請求前可救援已耗盡狀態，成功回覆後可立即處理剛跨過門檻的狀態。
 - 兩個觸發點共用單一 auto-reset coordinator，以跨程序鎖、鎖內重新查詢、持久化 idempotency key 與 cooldown 防止重複消耗。
-- 符合條件時，查詢 reset-credit 詳細清單，選擇最早到期且狀態為 `available` 的券，呼叫 `POST /wham/rate-limit-reset-credits/consume`。
+- 符合條件時，查詢 reset-credit 詳細清單，選擇最早到期且狀態為 `available` 的券，呼叫 reset-credit consume 端點。
 - 成功後重新抓取 usage 與 credits，footer 顯示一行透明稽核訊息，例如 `Codex auto reset | weekly 0% → 100% | reset credits 3 → 2`。
 - 所有錯誤 fail-closed：不猜測缺失的 weekly window、不自動改用其他 window、不破壞原本模型回覆。
 

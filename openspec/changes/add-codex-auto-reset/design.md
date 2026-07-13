@@ -1,8 +1,8 @@
 ## Context
 
-The plugin already calls `GET https://chatgpt.com/backend-api/wham/usage` and normalizes Codex weekly usage plus `rate_limit_reset_credits.available_count`. OpenAI's Codex client also uses `GET /wham/rate-limit-reset-credits` to list credits and `POST /wham/rate-limit-reset-credits/consume` with `redeem_request_id` and optional `credit_id` to consume one.
+The plugin already calls the Codex usage endpoint and normalizes Codex weekly usage plus the available reset-credit count. The Codex client also exposes a reset-credit *list* endpoint to enumerate credits and a reset-credit *consume* endpoint that takes a redeem request id and an optional credit id to consume one.
 
-A live test on 2026-07-13 returned HTTP 200 with `code: reset`, reset one weekly window from 11% used to 0% used, and reduced credits from 3 to 2. Consumption is irreversible and must be idempotent.
+A live test confirmed the consume endpoint returns HTTP 200 with a success code, resets one weekly window to 0% used, and decrements the available reset-credit count. Consumption is irreversible and must be idempotent.
 
 The existing `transform_llm_output` hook runs only after a successful response, so a footer-only design can miss `threshold=0` when the provider rejects the request first. Hermes also exposes `pre_llm_call`, which runs once before the request and includes the model.
 
