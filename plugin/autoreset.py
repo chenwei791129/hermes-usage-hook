@@ -500,31 +500,87 @@ def _remove_lock_dir(path: Path) -> None:
         pass
 
 
-def _try_create_lock(path: Path, owner: str, now: float) -> bool:
+def _lock_identity(path: Path) -> tuple[int, int] | None:
+    """Return filesystem identity so stale reclaim cannot target a replacement."""
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return stat_result.st_dev, stat_result.st_ino
+
+
+def _reclaim_guard_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.reclaim")
+
+
+def _try_create_lock(
+    path: Path, owner: str, now: float, *, ignore_reclaim_guard: bool = False
+) -> bool:
+    guard_path = _reclaim_guard_path(path)
+    if not ignore_reclaim_guard and guard_path.exists():
+        return False
     try:
         path.mkdir()
     except FileExistsError:
         return False
+    if not ignore_reclaim_guard and guard_path.exists():
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+        return False
     metadata_path = path / "owner.json"
-    descriptor = os.open(metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return True
-
-
-def _reclaim_stale_lock(path: Path, owner: str) -> bool:
-    stale_path = path.with_name(f"{path.name}.stale.{os.getpid()}.{owner}")
     try:
-        os.rename(path, stale_path)
-    except (FileNotFoundError, FileExistsError, OSError):
-        return False
-    try:
-        _remove_lock_dir(stale_path)
+        descriptor = os.open(
+            metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"owner": owner, "pid": os.getpid(), "created_at": now}, handle
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
     except OSError:
+        try:
+            _remove_lock_dir(path)
+        except OSError:
+            pass
         return False
     return True
+
+
+def _reclaim_stale_lock(
+    path: Path,
+    owner: str,
+    *,
+    expected_identity: tuple[int, int],
+    now: float,
+) -> bool:
+    guard_path = _reclaim_guard_path(path)
+    try:
+        guard_path.mkdir()
+    except (FileExistsError, OSError):
+        return False
+    try:
+        if _lock_identity(path) != expected_identity or not _lock_is_stale(path, now):
+            return False
+        stale_path = path.with_name(f"{path.name}.stale.{os.getpid()}.{owner}")
+        try:
+            os.rename(path, stale_path)
+        except (FileNotFoundError, FileExistsError, OSError):
+            return False
+        try:
+            _remove_lock_dir(stale_path)
+        except OSError:
+            return False
+        return _try_create_lock(
+            path, owner, now, ignore_reclaim_guard=True
+        )
+    finally:
+        try:
+            guard_path.rmdir()
+        except OSError:
+            pass
 
 
 def _release_owned_lock(path: Path, owner: str) -> None:
@@ -547,9 +603,18 @@ def acquire_autoreset_lock(
     timestamp = time.time() if now is None else now
     owner = str(uuid4())
     acquired = _try_create_lock(path, owner, timestamp)
-    if not acquired and _lock_is_stale(path, timestamp):
-        if _reclaim_stale_lock(path, owner):
-            acquired = _try_create_lock(path, owner, timestamp)
+    observed_identity = _lock_identity(path)
+    if (
+        not acquired
+        and observed_identity is not None
+        and _lock_is_stale(path, timestamp)
+    ):
+        acquired = _reclaim_stale_lock(
+            path,
+            owner,
+            expected_identity=observed_identity,
+            now=timestamp,
+        )
     try:
         yield acquired
     finally:
@@ -568,9 +633,18 @@ def acquire_notice_lock(
     timestamp = time.time() if now is None else now
     owner = str(uuid4())
     acquired = _try_create_lock(path, owner, timestamp)
-    if not acquired and _lock_is_stale(path, timestamp):
-        if _reclaim_stale_lock(path, owner):
-            acquired = _try_create_lock(path, owner, timestamp)
+    observed_identity = _lock_identity(path)
+    if (
+        not acquired
+        and observed_identity is not None
+        and _lock_is_stale(path, timestamp)
+    ):
+        acquired = _reclaim_stale_lock(
+            path,
+            owner,
+            expected_identity=observed_identity,
+            now=timestamp,
+        )
     try:
         yield acquired
     finally:
@@ -580,6 +654,7 @@ def acquire_notice_lock(
 
 COOLDOWN_RETRY_SECONDS = 60.0
 COOLDOWN_EXHAUSTED_SECONDS = 5 * 60.0
+COOLDOWN_SUCCESS_SECONDS = 5 * 60.0
 TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429})
 
 
@@ -895,8 +970,13 @@ def maybe_autoreset(
                         after_credits = _usage_credit_count(refreshed)
                 except Exception:
                     pass
-                state["pending"] = None
-                _clear_cooldown(state)
+                _set_cooldown(
+                    state,
+                    now=now,
+                    seconds=COOLDOWN_SUCCESS_SECONDS,
+                    reason="success",
+                    clear_pending=True,
+                )
                 state_store.write(state)
                 message = _notice_message(
                     status=code,

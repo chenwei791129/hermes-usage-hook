@@ -596,6 +596,7 @@ def test_readme_documents_codex_autoreset_configuration():
         "OAuth credentials do not belong in plugin config",
         "autoreset-notices.json",
         "autoreset-notices.lock/",
+        "five-minute suppression window",
         "env → plugin config → defaults",
         "plugins.entries.<plugin_id>",
         "load_config()",

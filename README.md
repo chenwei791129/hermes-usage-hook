@@ -116,7 +116,9 @@ earliest-expiring available credit, persists a redeem request ID before POST,
 and reuses that ID on ambiguous retries. Null expiries sort last. Missing
 credits, nothing-to-reset responses, deterministic failures, and unknown
 responses enter short cooldowns to avoid per-hook POST spam; transient GET
-failures use a shorter retry cooldown.
+failures use a shorter retry cooldown. A successful terminal response also sets
+a five-minute suppression window so stale usage during backend propagation cannot
+start a second consume attempt.
 
 After a successful reset, the footer includes an audit example like:
 

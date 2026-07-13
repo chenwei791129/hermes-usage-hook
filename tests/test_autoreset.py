@@ -406,6 +406,29 @@ def test_stale_lock_can_be_reclaimed_once(tmp_path):
                 assert third is False
 
 
+def test_stale_reclaimer_never_steals_fresh_replacement(tmp_path):
+    lock_path = tmp_path / "state" / autoreset.PLUGIN_ID / "autoreset.lock"
+    lock_path.mkdir(parents=True)
+    (lock_path / "owner.json").write_text(
+        '{"owner":"stale-owner","created_at":1000.0}'
+    )
+    observed_identity = autoreset._lock_identity(lock_path)
+    assert observed_identity is not None
+
+    autoreset._remove_lock_dir(lock_path)
+    assert autoreset._try_create_lock(lock_path, "fresh-owner", 1_120.0)
+
+    reclaimed = autoreset._reclaim_stale_lock(
+        lock_path,
+        "reclaimer",
+        expected_identity=observed_identity,
+        now=1_120.1,
+    )
+
+    assert reclaimed is False
+    assert autoreset._lock_metadata(lock_path)["owner"] == "fresh-owner"
+
+
 def test_cooldown_blocks_until_deadline(tmp_path):
     store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
     state = {"cooldown_until": 1_060.0, "cooldown_reason": "no_credit"}
@@ -687,6 +710,46 @@ def test_reset_persists_before_post_then_refreshes(tmp_path):
     assert store.load()["pending"] is None
 
 
+def test_success_cooldown_blocks_sequential_consume_on_stale_usage(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    consumer = _Consumer(response={"status": "reset"})
+
+    first = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=5),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=consumer,
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+    second = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=consumer,
+        uuid_factory=_never,
+        lock_factory=_never,
+        clock=lambda: 1_001.0,
+    )
+
+    assert first.status == "reset"
+    assert second.status == "cooldown"
+    assert consumer.calls == [("req-1", "credit-1")]
+    state = store.load()
+    assert state["cooldown_reason"] == "success"
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_SUCCESS_SECONDS
+
+
 def test_post_timeout_preserves_pending_attempt(tmp_path):
     store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
     consumer = _Consumer(error=TimeoutError("request timed out"))
@@ -803,7 +866,7 @@ def test_fresh_attempt_waits_until_terminal_response_clears_pending(tmp_path):
         consumer=consumer,
         uuid_factory=_Uuids("req-2"),
         lock_factory=_LockFactory(True),
-        clock=lambda: 1_002.0,
+        clock=lambda: 1_301.0,
     )
 
     assert later.status == "reset"
@@ -1104,7 +1167,8 @@ def test_two_contenders_cause_one_logical_consume(tmp_path):
     second = run()
 
     assert first.status == "already_redeemed"
-    assert second.status == "busy"
+    assert second.status == "cooldown"
+    assert lock_factory.calls == 1
     assert len(consumer.calls) == 1
 
 
