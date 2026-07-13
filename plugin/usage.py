@@ -108,24 +108,27 @@ def format_summary(usage: dict) -> str:
 
     Consumes only the normalized structure. The ``5h`` window renders first; a
     ``weekly`` window, when present, renders as a second line joined by a
-    newline. Reset times on both lines use the shared :func:`_format_duration`
-    formatter. ``| plan <plan_type>`` is appended to the ``5h`` line only when a
-    plan is present. When the ``5h`` window is missing, reports unavailability
-    and renders no ``weekly`` line.
+    newline. If the provider omits ``5h`` but still returns ``weekly``, the
+    weekly window is rendered as the available fallback. Reset times use the
+    shared :func:`_format_duration` formatter. ``| plan <plan_type>`` is
+    appended to the first rendered line when a plan is present.
     """
     provider = usage.get("provider")
     windows = usage.get("windows", {})
+    lines = []
+
     window_5h = windows.get("5h", {})
-    if not window_5h:
-        return f"{provider} usage: 5h window unavailable"
+    if window_5h:
+        lines.append(_format_window(provider, "5h", window_5h))
 
-    line_5h = _format_window(provider, "5h", window_5h)
-    plan_type = usage.get("plan_type")
-    if plan_type:
-        line_5h += f" | plan {plan_type}"
-
-    lines = [line_5h]
     window_weekly = windows.get("weekly", {})
     if window_weekly:
         lines.append(_format_window(provider, "weekly", window_weekly))
+
+    if not lines:
+        return f"{provider} usage: windows unavailable"
+
+    plan_type = usage.get("plan_type")
+    if plan_type:
+        lines[0] += f" | plan {plan_type}"
     return "\n".join(lines)
