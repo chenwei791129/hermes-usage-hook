@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.2.2...v0.3.0) (2026-07-13)
+
+
+### Features
+
+* show available Codex reset credits ([206582f](https://github.com/chenwei791129/hermes-usage-hook/commit/206582fd510e6bce437adb49672378bdda30f64a))
+
 ## [0.2.2](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.2.1...v0.2.2) (2026-07-13)
 
 
