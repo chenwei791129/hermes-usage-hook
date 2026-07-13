@@ -180,11 +180,13 @@ def _normalize(raw: dict) -> dict:
             ),
         }
     credits = raw.get("credits") or {}
+    reset_credits = raw.get("rate_limit_reset_credits") or {}
     return {
         "provider": "Codex",
         "plan_type": raw.get("plan_type"),
         "windows": windows,
         "credits_balance": credits.get("balance"),
+        "reset_credits_available": reset_credits.get("available_count"),
     }
 
 
