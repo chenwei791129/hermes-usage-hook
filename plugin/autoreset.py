@@ -7,14 +7,19 @@ import os
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
-from .usage import matches_codex_model
+from .providers.codex_usage import (
+    consume_rate_limit_reset_credit,
+    list_rate_limit_reset_credits,
+)
+from .usage import get_usage_for_model, matches_codex_model
 
 PLUGIN_ID = "hermes-usage-hook"
 ENV_ENABLED = "CODEX_ENABLE_AUTORESET"
@@ -513,3 +518,338 @@ def acquire_autoreset_lock(
     finally:
         if acquired:
             _release_owned_lock(path, owner)
+
+
+COOLDOWN_RETRY_SECONDS = 60.0
+COOLDOWN_EXHAUSTED_SECONDS = 5 * 60.0
+
+
+@dataclass(frozen=True)
+class AutoResetResult:
+    status: str
+    before_remaining: int | float | None = None
+    after_remaining: int | float | None = None
+    before_credits: int | None = None
+    after_credits: int | None = None
+    after_usage: dict | None = None
+    message: str | None = None
+
+
+def _usage_credit_count(usage: dict) -> int | None:
+    count = usage.get("reset_credits_available")
+    if isinstance(count, bool) or not isinstance(count, int):
+        return None
+    return count
+
+
+def _set_cooldown(
+    state: dict, *, now: float, seconds: float, reason: str, clear_pending: bool
+) -> None:
+    state["cooldown_until"] = now + seconds
+    state["cooldown_reason"] = reason
+    if clear_pending:
+        state["pending"] = None
+
+
+def _clear_cooldown(state: dict) -> None:
+    state.pop("cooldown_until", None)
+    state.pop("cooldown_reason", None)
+
+
+def _pending_record(state: dict) -> dict | None:
+    pending = state.get("pending")
+    if not isinstance(pending, dict) or pending.get("status") != "pending":
+        return None
+    request_id = pending.get("redeem_request_id")
+    credit_id = pending.get("credit_id")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    if not isinstance(credit_id, str) or not credit_id:
+        return None
+    return pending
+
+
+def _notice_message(
+    *,
+    status: str,
+    before_remaining: int | float | None,
+    after_remaining: int | float | None,
+    before_credits: int | None,
+    after_credits: int | None,
+) -> str:
+    if (
+        before_remaining is not None
+        and after_remaining is not None
+        and before_credits is not None
+        and after_credits is not None
+    ):
+        return (
+            "Codex auto reset | "
+            f"weekly {before_remaining:g}% → {after_remaining:g}% | "
+            f"reset credits {before_credits} → {after_credits}"
+        )
+    if status == "reset":
+        return "Codex auto reset | reset accepted; usage refresh unavailable"
+    return "Codex auto reset | reset already redeemed; usage refresh unavailable"
+
+
+def maybe_autoreset(
+    *,
+    model: str | None,
+    usage: dict | None = None,
+    session_id: str = "",
+    turn_id: str = "",
+    config: AutoResetConfig | None = None,
+    store: Any = None,
+    usage_fetcher: Callable[[], dict] | None = None,
+    credit_lister: Callable[[], dict] | None = None,
+    consumer: Callable[[str, str | None], dict] | None = None,
+    uuid_factory: Callable[[], object] | None = None,
+    lock_factory: Callable[[], AbstractContextManager[bool]] | None = None,
+    clock: Callable[[], float] = time.time,
+) -> AutoResetResult:
+    """Attempt one synchronous, fail-closed, idempotent Codex auto reset."""
+    del turn_id  # Reserved for future non-sensitive audit correlation.
+    try:
+        effective = config if config is not None else load_autoreset_config()
+        if not effective.valid:
+            return AutoResetResult("invalid_config", message=effective.error)
+        if not effective.enabled:
+            return AutoResetResult("disabled")
+        if not matches_codex_model(model):
+            return AutoResetResult("not_codex")
+
+        fetch_usage = usage_fetcher or (lambda: get_usage_for_model(model) or {})
+        list_credits = credit_lister or list_rate_limit_reset_credits
+        consume = consumer or consume_rate_limit_reset_credit
+        make_uuid = uuid_factory or uuid4
+        state_store = store or AutoResetStateStore(clock=clock)
+
+        initial_usage = usage
+        if initial_usage is None:
+            try:
+                initial_usage = fetch_usage()
+            except Exception as exc:
+                return AutoResetResult("transient", message=str(exc))
+        if not isinstance(initial_usage, dict):
+            return AutoResetResult("ineligible")
+        before_remaining = weekly_remaining(initial_usage)
+        before_credits = _usage_credit_count(initial_usage)
+        if not is_eligible(model=model, usage=initial_usage, config=effective):
+            return AutoResetResult(
+                "ineligible",
+                before_remaining=before_remaining,
+                before_credits=before_credits,
+            )
+
+        now = clock()
+        prelock_state = state_store.load()
+        if state_store.cooldown_active(prelock_state, now=now):
+            return AutoResetResult(
+                "cooldown",
+                before_remaining=before_remaining,
+                before_credits=before_credits,
+            )
+        prelock_pending = _pending_record(prelock_state)
+        if prelock_pending is not None:
+            retry_after = prelock_pending.get("retry_after")
+            if isinstance(retry_after, (int, float)) and now < retry_after:
+                return AutoResetResult(
+                    "cooldown",
+                    before_remaining=before_remaining,
+                    before_credits=before_credits,
+                )
+
+        make_lock = lock_factory or (
+            lambda: acquire_autoreset_lock(home=state_store.home, now=now)
+        )
+        with make_lock() as acquired:
+            if not acquired:
+                return AutoResetResult(
+                    "busy",
+                    before_remaining=before_remaining,
+                    before_credits=before_credits,
+                )
+
+            state = state_store.load()
+            if state_store.cooldown_active(state, now=now):
+                return AutoResetResult(
+                    "cooldown",
+                    before_remaining=before_remaining,
+                    before_credits=before_credits,
+                )
+            pending = _pending_record(state)
+            if pending is not None:
+                retry_after = pending.get("retry_after")
+                if isinstance(retry_after, (int, float)) and now < retry_after:
+                    return AutoResetResult(
+                        "cooldown",
+                        before_remaining=before_remaining,
+                        before_credits=before_credits,
+                    )
+
+            try:
+                live_usage = fetch_usage()
+            except Exception as exc:
+                _set_cooldown(
+                    state,
+                    now=now,
+                    seconds=COOLDOWN_RETRY_SECONDS,
+                    reason="transient",
+                    clear_pending=False,
+                )
+                state_store.write(state)
+                return AutoResetResult("transient", message=str(exc))
+            if not isinstance(live_usage, dict) or not is_eligible(
+                model=model, usage=live_usage, config=effective
+            ):
+                return AutoResetResult(
+                    "ineligible",
+                    before_remaining=weekly_remaining(live_usage)
+                    if isinstance(live_usage, dict)
+                    else None,
+                    before_credits=_usage_credit_count(live_usage)
+                    if isinstance(live_usage, dict)
+                    else None,
+                )
+
+            if pending is None:
+                before_remaining = weekly_remaining(live_usage)
+                before_credits = _usage_credit_count(live_usage)
+                try:
+                    details = list_credits()
+                except Exception as exc:
+                    _set_cooldown(
+                        state,
+                        now=now,
+                        seconds=COOLDOWN_RETRY_SECONDS,
+                        reason="transient",
+                        clear_pending=False,
+                    )
+                    state_store.write(state)
+                    return AutoResetResult("transient", message=str(exc))
+                selected = (
+                    select_earliest_available_credit(details)
+                    if isinstance(details, dict)
+                    else None
+                )
+                if selected is None:
+                    _set_cooldown(
+                        state,
+                        now=now,
+                        seconds=COOLDOWN_EXHAUSTED_SECONDS,
+                        reason="no_credit",
+                        clear_pending=True,
+                    )
+                    state_store.write(state)
+                    return AutoResetResult(
+                        "no_credit",
+                        before_remaining=before_remaining,
+                        before_credits=before_credits,
+                    )
+                request_id = str(make_uuid())
+                credit_id = selected["id"]
+                pending = {
+                    "redeem_request_id": request_id,
+                    "credit_id": credit_id,
+                    "status": "pending",
+                    "created_at": now,
+                    "updated_at": now,
+                    "retry_after": now,
+                    "before_remaining": before_remaining,
+                    "before_credits": before_credits,
+                }
+                state["pending"] = pending
+                _clear_cooldown(state)
+                state_store.write(state)
+            else:
+                request_id = pending["redeem_request_id"]
+                credit_id = pending["credit_id"]
+                before_remaining = pending.get("before_remaining")
+                before_credits = pending.get("before_credits")
+
+            try:
+                response = consume(request_id, credit_id)
+            except Exception as exc:
+                pending["updated_at"] = now
+                pending["retry_after"] = now + COOLDOWN_RETRY_SECONDS
+                pending["status"] = "pending"
+                state["pending"] = pending
+                state_store.write(state)
+                return AutoResetResult(
+                    "pending",
+                    before_remaining=before_remaining,
+                    before_credits=before_credits,
+                    message=str(exc),
+                )
+
+            code = None
+            if isinstance(response, dict):
+                code = response.get("code", response.get("status"))
+            if code in {"reset", "already_redeemed"}:
+                after_usage = None
+                after_remaining = None
+                after_credits = None
+                try:
+                    refreshed = fetch_usage()
+                    if isinstance(refreshed, dict):
+                        after_usage = refreshed
+                        after_remaining = weekly_remaining(refreshed)
+                        after_credits = _usage_credit_count(refreshed)
+                except Exception:
+                    pass
+                state["pending"] = None
+                _clear_cooldown(state)
+                state_store.write(state)
+                message = _notice_message(
+                    status=code,
+                    before_remaining=before_remaining,
+                    after_remaining=after_remaining,
+                    before_credits=before_credits,
+                    after_credits=after_credits,
+                )
+                state_store.queue_notice(session_id, message, now=now)
+                return AutoResetResult(
+                    code,
+                    before_remaining=before_remaining,
+                    after_remaining=after_remaining,
+                    before_credits=before_credits,
+                    after_credits=after_credits,
+                    after_usage=after_usage,
+                    message=message,
+                )
+
+            if code in {"nothing_to_reset", "no_credit"}:
+                _set_cooldown(
+                    state,
+                    now=now,
+                    seconds=COOLDOWN_EXHAUSTED_SECONDS,
+                    reason=code,
+                    clear_pending=True,
+                )
+                state_store.write(state)
+                return AutoResetResult(
+                    code,
+                    before_remaining=before_remaining,
+                    before_credits=before_credits,
+                )
+
+            pending["updated_at"] = now
+            pending["retry_after"] = now + COOLDOWN_EXHAUSTED_SECONDS
+            pending["status"] = "pending"
+            state["pending"] = pending
+            _set_cooldown(
+                state,
+                now=now,
+                seconds=COOLDOWN_EXHAUSTED_SECONDS,
+                reason="unknown",
+                clear_pending=False,
+            )
+            state_store.write(state)
+            return AutoResetResult(
+                "unknown",
+                before_remaining=before_remaining,
+                before_credits=before_credits,
+            )
+    except Exception as exc:
+        return AutoResetResult("error", message=str(exc))

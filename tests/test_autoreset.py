@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 
 from plugin import autoreset
@@ -439,3 +441,533 @@ def test_empty_session_id_never_leaks_notice_across_sessions(tmp_path):
     assert not store.queue_notice("", "must not persist", now=1_000.0)
     assert store.pop_notice("", now=1_001.0) is None
     assert store.pop_notice("another-session", now=1_001.0) is None
+
+
+# --- Synchronous coordinator with stable retry identity -----------------------
+
+
+def _never(*args, **kwargs):
+    raise AssertionError("dependency must not be called on this path")
+
+
+@contextmanager
+def _held(acquired):
+    yield acquired
+
+
+class _LockFactory:
+    """Yield a sequence of acquisition results for successive contenders."""
+
+    def __init__(self, *acquired):
+        self._acquired = list(acquired) or [True]
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        value = self._acquired.pop(0) if self._acquired else False
+        return _held(value)
+
+
+class _Fetcher:
+    """Return queued usage snapshots (or raise queued errors) in order."""
+
+    def __init__(self, *responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if not self._responses:
+            raise AssertionError("unexpected usage_fetcher call")
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class _Lister:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.payload
+
+
+class _Consumer:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def __call__(self, redeem_request_id, credit_id):
+        self.calls.append((redeem_request_id, credit_id))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+class _Uuids:
+    def __init__(self, *values):
+        self._values = list(values)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self._values.pop(0)
+
+
+def _valid_credit_list(credit_id="credit-1", expires_at="2026-07-18T00:40:00Z"):
+    return _credit_payload(_credit(credit_id, expires_at))
+
+
+def _seed_pending(store, **overrides):
+    pending = {
+        "redeem_request_id": "req-1",
+        "credit_id": "credit-1",
+        "status": "pending",
+        "created_at": 900.0,
+        "updated_at": 900.0,
+        "retry_after": 900.0,
+        "before_remaining": 5,
+        "before_credits": 2,
+    }
+    pending.update(overrides)
+    store.write({"pending": pending, "notices": {}})
+
+
+class _ExplodingStore:
+    home = None
+
+    def load(self):
+        raise autoreset.CorruptStateError("state is unreadable")
+
+
+def test_disabled_returns_before_any_network_or_state_mutation(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=autoreset.AutoResetConfig(enabled=False, threshold=10),
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_never,
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "disabled"
+    assert not store.path.exists()
+
+
+def test_above_threshold_does_not_lock_or_list_credits(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=50),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "ineligible"
+    assert not store.path.exists()
+
+
+def test_eligible_path_rechecks_usage_inside_lock(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    fetcher = _Fetcher(
+        _eligible_usage(remaining=5),
+        _eligible_usage(remaining=100, credits=1),
+    )
+    lister = _Lister(_valid_credit_list())
+    consumer = _Consumer(response={"status": "already_redeemed"})
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=fetcher,
+        credit_lister=lister,
+        consumer=consumer,
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "already_redeemed"
+    assert fetcher.calls == 2  # lock-time recheck plus success refresh
+    assert lister.calls == 1
+    assert consumer.calls == [("req-1", "credit-1")]
+
+
+def test_recheck_above_threshold_avoids_consume(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    consumer = _Consumer(response={"status": "reset"})
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=80)),
+        credit_lister=_never,
+        consumer=consumer,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "ineligible"
+    assert consumer.calls == []
+
+
+def test_reset_persists_before_post_then_refreshes(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    captured = {}
+
+    def consumer(redeem_request_id, credit_id):
+        captured["args"] = (redeem_request_id, credit_id)
+        captured["pending"] = store.load()["pending"]
+        return {"status": "reset"}
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-1",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=consumer,
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert captured["args"] == ("req-1", "credit-1")
+    assert captured["pending"]["redeem_request_id"] == "req-1"
+    assert captured["pending"]["credit_id"] == "credit-1"
+    assert captured["pending"]["status"] == "pending"
+    assert result.status == "reset"
+    assert result.before_remaining == 5
+    assert result.after_remaining == 100
+    assert result.after_credits == 1
+    assert store.load()["pending"] is None
+
+
+def test_post_timeout_preserves_pending_attempt(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    consumer = _Consumer(error=TimeoutError("request timed out"))
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=consumer,
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "pending"
+    assert len(consumer.calls) == 1  # no generic retry inside one invocation
+    pending = store.load()["pending"]
+    assert pending["redeem_request_id"] == "req-1"
+    assert pending["credit_id"] == "credit-1"
+    assert pending["status"] == "pending"
+    assert pending["retry_after"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
+
+
+def test_future_retry_after_blocks_without_new_uuid_or_post(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store, retry_after=1_060.0)
+    uuids = _Uuids("new-request-must-not-be-used")
+    lock_factory = _LockFactory(True)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=uuids,
+        lock_factory=lock_factory,
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "cooldown"
+    assert lock_factory.calls == 0
+    assert uuids.calls == 0
+    pending = store.load()["pending"]
+    assert pending["redeem_request_id"] == "req-1"
+    assert pending["credit_id"] == "credit-1"
+
+
+def test_retry_reuses_same_uuid_and_credit_id(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store)
+    consumer = _Consumer(response={"status": "already_redeemed"})
+    fetcher = _Fetcher(
+        _eligible_usage(remaining=5),
+        _eligible_usage(remaining=100, credits=1),
+    )
+    lister = _Lister(_valid_credit_list("credit-OTHER"))
+    uuids = _Uuids()
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=fetcher,
+        credit_lister=lister,
+        consumer=consumer,
+        uuid_factory=uuids,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "already_redeemed"
+    assert consumer.calls == [("req-1", "credit-1")]
+    assert uuids.calls == 0
+    assert lister.calls == 0
+    assert fetcher.calls == 2
+    assert store.load()["pending"] is None
+
+
+def test_already_redeemed_is_successful_terminal(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-2",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "already_redeemed"}),
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "already_redeemed"
+    assert result.after_remaining == 100
+    assert result.after_credits == 1
+    assert store.load()["pending"] is None
+    assert store.pop_notice("sess-2", now=1_001.0) is not None
+
+
+def test_nothing_to_reset_sets_five_minute_cooldown(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "nothing_to_reset"}),
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "nothing_to_reset"
+    state = store.load()
+    assert state["pending"] is None
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_EXHAUSTED_SECONDS
+    assert state["cooldown_reason"] == "nothing_to_reset"
+
+
+def test_no_credit_sets_five_minute_cooldown(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    consumer = _Consumer(response={"status": "reset"})
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_Lister(_credit_payload()),
+        consumer=consumer,
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "no_credit"
+    assert consumer.calls == []
+    state = store.load()
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_EXHAUSTED_SECONDS
+    assert state["cooldown_reason"] == "no_credit"
+
+
+def test_transient_get_failure_sets_one_minute_cooldown(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    consumer = _Consumer(response={"status": "reset"})
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(ConnectionError("usage endpoint unreachable")),
+        credit_lister=_never,
+        consumer=consumer,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "transient"
+    assert consumer.calls == []
+    state = store.load()
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
+    assert state["cooldown_reason"] == "transient"
+
+
+def test_unknown_or_malformed_response_fails_closed(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-3",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "who-knows"}),
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "unknown"
+    assert store.pop_notice("sess-3", now=1_001.0) is None
+    pending = store.load()["pending"]
+    assert pending is not None
+    assert pending["redeem_request_id"] == "req-1"
+    assert pending["status"] == "pending"
+
+
+def test_two_contenders_cause_one_logical_consume(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    consumer = _Consumer(response={"status": "already_redeemed"})
+    lock_factory = _LockFactory(True, False)
+
+    def run():
+        return autoreset.maybe_autoreset(
+            model="gpt-5-codex",
+            usage=_eligible_usage(remaining=5),
+            config=_enabled_config(threshold=10),
+            store=store,
+            usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+            credit_lister=_Lister(_valid_credit_list()),
+            consumer=consumer,
+            uuid_factory=_Uuids("req-1"),
+            lock_factory=lock_factory,
+            clock=lambda: 1_000.0,
+        )
+
+    first = run()
+    second = run()
+
+    assert first.status == "already_redeemed"
+    assert second.status == "busy"
+    assert len(consumer.calls) == 1
+
+
+def test_success_queues_one_notice_for_session(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        session_id="sess-9",
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "reset"}),
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "reset"
+    message = store.pop_notice("sess-9", now=1_001.0)
+    assert message is not None
+    assert message.startswith("Codex auto reset")
+    assert store.pop_notice("sess-9", now=1_002.0) is None
+
+
+def test_hook_facing_api_never_raises(tmp_path):
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=_ExplodingStore(),
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "reset"}),
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "error"
+
+
+def test_pending_and_cooldown_writes_preserve_existing_notice(tmp_path):
+    # Regression for the Task 5 review finding: a load-modify-write update that
+    # sets pending/cooldown must not clobber a notice queued for another session.
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    store.queue_notice("sess-earlier", "earlier notice", now=1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_Lister(_credit_payload()),
+        consumer=_Consumer(),
+        uuid_factory=_Uuids(),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "no_credit"
+    assert store.cooldown_active(store.load(), now=1_000.0)
+    assert store.pop_notice("sess-earlier", now=1_001.0) == "earlier notice"
