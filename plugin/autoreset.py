@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
-from collections.abc import Mapping
+import tempfile
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
+from pathlib import Path
+from uuid import uuid4
 
 from .usage import matches_codex_model
 
@@ -223,3 +229,287 @@ def select_earliest_available_credit(payload: dict) -> dict | None:
     if not candidates:
         return None
     return min(candidates, key=lambda candidate: candidate[:2])[2]
+
+
+STATE_VERSION = 1
+LOCK_STALE_SECONDS = 120.0
+NOTICE_TTL_SECONDS = 24 * 60 * 60
+
+_PENDING_FIELDS = frozenset(
+    {
+        "redeem_request_id",
+        "credit_id",
+        "status",
+        "created_at",
+        "updated_at",
+        "retry_after",
+        "before_remaining",
+        "before_credits",
+    }
+)
+
+
+class CorruptStateError(RuntimeError):
+    """Raised after corrupt state has been quarantined for fail-closed handling."""
+
+
+def _hermes_home() -> Path:
+    """Return the active profile's Hermes home without importing Hermes."""
+    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+
+
+def _clean_state(state: dict) -> dict:
+    cleaned: dict = {"version": STATE_VERSION}
+
+    pending = state.get("pending")
+    if isinstance(pending, dict):
+        cleaned["pending"] = {
+            key: value
+            for key, value in pending.items()
+            if key in _PENDING_FIELDS
+            and isinstance(value, (str, int, float))
+            and not isinstance(value, bool)
+        }
+    elif pending is None:
+        cleaned["pending"] = None
+
+    cooldown_until = state.get("cooldown_until")
+    if isinstance(cooldown_until, (int, float)) and not isinstance(
+        cooldown_until, bool
+    ):
+        cleaned["cooldown_until"] = cooldown_until
+    cooldown_reason = state.get("cooldown_reason")
+    if isinstance(cooldown_reason, str):
+        cleaned["cooldown_reason"] = cooldown_reason
+
+    notices = state.get("notices")
+    clean_notices = {}
+    if isinstance(notices, dict):
+        for session_id, notice in notices.items():
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            if not isinstance(notice, dict):
+                continue
+            message = notice.get("message")
+            created_at = notice.get("created_at")
+            if (
+                isinstance(message, str)
+                and isinstance(created_at, (int, float))
+                and not isinstance(created_at, bool)
+            ):
+                clean_notices[session_id] = {
+                    "message": message,
+                    "created_at": created_at,
+                }
+    cleaned["notices"] = clean_notices
+    return cleaned
+
+
+class AutoResetStateStore:
+    """Atomic profile-local persistence for safe auto-reset coordination state."""
+
+    def __init__(
+        self,
+        *,
+        home: Path | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.home = Path(home) if home is not None else _hermes_home()
+        self.path = self.home / "state" / PLUGIN_ID / "autoreset.json"
+        self.lock_path = self.home / "state" / PLUGIN_ID / "autoreset.lock"
+        self.clock = clock
+
+    @staticmethod
+    def empty() -> dict:
+        return {"version": STATE_VERSION, "pending": None, "notices": {}}
+
+    def _quarantine(self) -> Path:
+        stamp = int(self.clock())
+        candidate = self.path.with_name(f"autoreset.corrupt.{stamp}.json")
+        suffix = 1
+        while candidate.exists():
+            candidate = self.path.with_name(
+                f"autoreset.corrupt.{stamp}.{suffix}.json"
+            )
+            suffix += 1
+        os.replace(self.path, candidate)
+        return candidate
+
+    def load(self) -> dict:
+        if not self.path.exists():
+            return self.empty()
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict) or loaded.get("version") != STATE_VERSION:
+                raise ValueError("unsupported or malformed auto-reset state")
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            try:
+                quarantined = self._quarantine()
+            except OSError:
+                quarantined = self.path
+            raise CorruptStateError(
+                f"corrupt auto-reset state quarantined at {quarantined}"
+            ) from exc
+        return _clean_state(loaded)
+
+    def write(self, state: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        cleaned = _clean_state(state)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=".autoreset.", suffix=".tmp", dir=self.path.parent
+        )
+        temp_path = Path(temp_name)
+        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+            except (AttributeError, OSError):
+                pass
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(cleaned, handle, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+            try:
+                self.path.chmod(0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def cooldown_active(state: dict, *, now: float) -> bool:
+        deadline = state.get("cooldown_until")
+        return (
+            isinstance(deadline, (int, float))
+            and not isinstance(deadline, bool)
+            and now < deadline
+        )
+
+    @staticmethod
+    def _prune_notices(state: dict, now: float) -> dict:
+        notices = state.get("notices")
+        if not isinstance(notices, dict):
+            notices = {}
+        state["notices"] = {
+            session_id: notice
+            for session_id, notice in notices.items()
+            if isinstance(notice, dict)
+            and isinstance(notice.get("created_at"), (int, float))
+            and now - notice["created_at"] <= NOTICE_TTL_SECONDS
+        }
+        return state["notices"]
+
+    def queue_notice(
+        self, session_id: str, message: str, *, now: float | None = None
+    ) -> bool:
+        if not session_id:
+            return False
+        timestamp = self.clock() if now is None else now
+        state = self.load()
+        notices = self._prune_notices(state, timestamp)
+        notices[session_id] = {"message": message, "created_at": timestamp}
+        self.write(state)
+        return True
+
+    def pop_notice(self, session_id: str, *, now: float | None = None) -> str | None:
+        if not session_id:
+            return None
+        timestamp = self.clock() if now is None else now
+        state = self.load()
+        notices = self._prune_notices(state, timestamp)
+        notice = notices.pop(session_id, None)
+        if notice is None:
+            return None
+        self.write(state)
+        message = notice.get("message")
+        return message if isinstance(message, str) else None
+
+
+def _lock_metadata(path: Path) -> dict:
+    try:
+        loaded = json.loads((path / "owner.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _lock_is_stale(path: Path, now: float) -> bool:
+    metadata = _lock_metadata(path)
+    created_at = metadata.get("created_at")
+    if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+        try:
+            created_at = path.stat().st_mtime
+        except OSError:
+            return False
+    return now - created_at >= LOCK_STALE_SECONDS
+
+
+def _remove_lock_dir(path: Path) -> None:
+    try:
+        (path / "owner.json").unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        pass
+
+
+def _try_create_lock(path: Path, owner: str, now: float) -> bool:
+    try:
+        path.mkdir()
+    except FileExistsError:
+        return False
+    metadata_path = path / "owner.json"
+    descriptor = os.open(metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return True
+
+
+def _reclaim_stale_lock(path: Path, owner: str) -> bool:
+    stale_path = path.with_name(f"{path.name}.stale.{os.getpid()}.{owner}")
+    try:
+        os.rename(path, stale_path)
+    except (FileNotFoundError, FileExistsError, OSError):
+        return False
+    try:
+        _remove_lock_dir(stale_path)
+    except OSError:
+        return False
+    return True
+
+
+def _release_owned_lock(path: Path, owner: str) -> None:
+    if _lock_metadata(path).get("owner") != owner:
+        return
+    try:
+        _remove_lock_dir(path)
+    except OSError:
+        pass
+
+
+@contextmanager
+def acquire_autoreset_lock(
+    *, home: Path | None = None, now: float | None = None
+) -> Iterator[bool]:
+    """Acquire the cross-process lock, reclaiming at most one stale holder."""
+    lock_home = Path(home) if home is not None else _hermes_home()
+    path = lock_home / "state" / PLUGIN_ID / "autoreset.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.time() if now is None else now
+    owner = str(uuid4())
+    acquired = _try_create_lock(path, owner, timestamp)
+    if not acquired and _lock_is_stale(path, timestamp):
+        if _reclaim_stale_lock(path, owner):
+            acquired = _try_create_lock(path, owner, timestamp)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            _release_owned_lock(path, owner)

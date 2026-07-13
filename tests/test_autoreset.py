@@ -288,3 +288,154 @@ def test_malformed_available_row_does_not_hide_another_valid_credit():
 
     assert selected is not None
     assert selected["id"] == "valid"
+
+
+# --- Profile-local state, locking, cooldowns, and one-shot notices ------------
+
+
+def _pending_attempt():
+    return {
+        "redeem_request_id": "request-uuid",
+        "credit_id": "credit-1",
+        "status": "pending",
+        "created_at": 1_000.0,
+        "updated_at": 1_000.0,
+        "retry_after": 1_060.0,
+        "before_remaining": 0,
+        "before_credits": 3,
+    }
+
+
+def test_state_uses_hermes_home_and_contains_no_credentials(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store = autoreset.AutoResetStateStore(clock=lambda: 1_000.0)
+
+    store.write(
+        {
+            "pending": {
+                **_pending_attempt(),
+                "access_token": "must-not-persist",
+                "refresh_token": "also-secret",
+                "account_id": "private-account",
+                "headers": {"Authorization": "Bearer secret"},
+                "response": {"full": "body"},
+            }
+        }
+    )
+
+    assert store.path == (
+        tmp_path / "state" / "hermes-usage-hook" / "autoreset.json"
+    )
+    serialized = store.path.read_text()
+    for forbidden in (
+        "must-not-persist",
+        "also-secret",
+        "private-account",
+        "Authorization",
+        "response",
+    ):
+        assert forbidden not in serialized
+
+
+def test_state_write_is_atomic_and_owner_only_where_supported(monkeypatch, tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    real_replace = autoreset.os.replace
+    replacements = []
+
+    def recording_replace(source, destination):
+        replacements.append((source, destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(autoreset.os, "replace", recording_replace)
+
+    store.write({"pending": _pending_attempt()})
+
+    assert replacements and replacements[-1][1] == store.path
+    assert store.path.stat().st_mode & 0o777 == 0o600
+    assert list(store.path.parent.glob(".autoreset.*.tmp")) == []
+
+
+def test_pending_attempt_round_trips_identifiers(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    store.write({"pending": _pending_attempt()})
+
+    pending = store.load()["pending"]
+
+    assert pending["redeem_request_id"] == "request-uuid"
+    assert pending["credit_id"] == "credit-1"
+    assert pending["status"] == "pending"
+
+
+def test_corrupt_state_is_quarantined_and_invocation_fails_closed(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_234.5)
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text("{not-json")
+
+    with pytest.raises(autoreset.CorruptStateError):
+        store.load()
+
+    assert not store.path.exists()
+    quarantined = list(store.path.parent.glob("autoreset.corrupt.1234*.json"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == "{not-json"
+
+
+def test_only_one_process_style_lock_holder_wins(tmp_path):
+    with autoreset.acquire_autoreset_lock(home=tmp_path, now=1_000.0) as first:
+        assert first is True
+        with autoreset.acquire_autoreset_lock(home=tmp_path, now=1_000.0) as second:
+            assert second is False
+
+
+def test_fresh_lock_is_not_reclaimed(tmp_path):
+    with autoreset.acquire_autoreset_lock(home=tmp_path, now=1_000.0) as first:
+        assert first is True
+        with autoreset.acquire_autoreset_lock(home=tmp_path, now=1_119.9) as second:
+            assert second is False
+
+
+def test_stale_lock_can_be_reclaimed_once(tmp_path):
+    with autoreset.acquire_autoreset_lock(home=tmp_path, now=1_000.0) as first:
+        assert first is True
+        with autoreset.acquire_autoreset_lock(home=tmp_path, now=1_120.1) as second:
+            assert second is True
+            with autoreset.acquire_autoreset_lock(home=tmp_path, now=1_120.2) as third:
+                assert third is False
+
+
+def test_cooldown_blocks_until_deadline(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    state = {"cooldown_until": 1_060.0, "cooldown_reason": "no_credit"}
+
+    assert store.cooldown_active(state, now=1_059.9)
+    assert not store.cooldown_active(state, now=1_060.0)
+
+
+def test_notice_is_popped_once_for_matching_session(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    assert store.queue_notice("session-a", "reset complete", now=1_000.0)
+    assert store.queue_notice("session-b", "other session", now=1_000.0)
+
+    assert store.pop_notice("session-a", now=1_001.0) == "reset complete"
+    assert store.pop_notice("session-a", now=1_002.0) is None
+    assert store.pop_notice("session-b", now=1_003.0) == "other session"
+
+
+def test_expired_notice_is_pruned_after_twenty_four_hours(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    assert store.queue_notice("session-a", "expired", now=1_000.0)
+
+    assert (
+        store.pop_notice(
+            "session-a", now=1_000.0 + autoreset.NOTICE_TTL_SECONDS + 0.1
+        )
+        is None
+    )
+
+
+def test_empty_session_id_never_leaks_notice_across_sessions(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    assert not store.queue_notice("", "must not persist", now=1_000.0)
+    assert store.pop_notice("", now=1_001.0) is None
+    assert store.pop_notice("another-session", now=1_001.0) is None
