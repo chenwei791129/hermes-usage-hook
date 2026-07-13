@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.3.0...v0.4.0) (2026-07-13)
+
+
+### Features
+
+* add Codex auto reset credits ([#13](https://github.com/chenwei791129/hermes-usage-hook/issues/13)) ([4c7f5f5](https://github.com/chenwei791129/hermes-usage-hook/commit/4c7f5f5b14854d9c35c5dcdecb6250cd4523a015))
+
 ## [0.3.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.2.2...v0.3.0) (2026-07-13)
 
 

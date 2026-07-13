@@ -1,5 +1,5 @@
 name: hermes-usage-hook
-version: 0.3.0
+version: 0.4.0
 description: Append the current LLM provider's rate-limit usage as a reply footer.
 author: Chen-Wei Sun
 kind: standalone
