@@ -130,3 +130,161 @@ def test_missing_hermes_runtime_falls_back_to_defaults(monkeypatch):
         enabled=False,
         threshold=0,
     )
+
+
+# --- Pure auto-reset eligibility and credit selection -------------------------
+
+
+def _eligible_usage(*, remaining=10, credits=2):
+    return {
+        "provider": "Codex",
+        "windows": {"weekly": {"remaining_percent": remaining}},
+        "reset_credits_available": credits,
+    }
+
+
+def _enabled_config(threshold=10):
+    return autoreset.AutoResetConfig(enabled=True, threshold=threshold)
+
+
+def test_non_codex_model_is_ineligible():
+    assert not autoreset.is_eligible(
+        model="claude-opus-4",
+        usage=_eligible_usage(),
+        config=_enabled_config(),
+    )
+
+
+def test_missing_weekly_window_is_ineligible():
+    usage = _eligible_usage()
+    usage["windows"] = {"5h": {"remaining_percent": 0}}
+
+    assert autoreset.weekly_remaining(usage) is None
+    assert not autoreset.is_eligible(
+        model="gpt-5-codex", usage=usage, config=_enabled_config()
+    )
+
+
+@pytest.mark.parametrize("credits", [None, 0])
+def test_zero_or_missing_credit_count_is_ineligible(credits):
+    assert not autoreset.is_eligible(
+        model="gpt-5-codex",
+        usage=_eligible_usage(credits=credits),
+        config=_enabled_config(),
+    )
+
+
+def test_remaining_equal_to_threshold_is_eligible():
+    assert autoreset.is_eligible(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=10),
+        config=_enabled_config(threshold=10),
+    )
+
+
+def test_remaining_above_threshold_is_ineligible():
+    assert not autoreset.is_eligible(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=11),
+        config=_enabled_config(threshold=10),
+    )
+
+
+def test_remaining_below_threshold_is_eligible():
+    assert autoreset.is_eligible(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=9),
+        config=_enabled_config(threshold=10),
+    )
+
+
+def _credit(credit_id, expires_at, *, status="available", reset_type="full"):
+    return {
+        "id": credit_id,
+        "status": status,
+        "expires_at": expires_at,
+        "reset_type": reset_type,
+    }
+
+
+def _credit_payload(*credits, available_count=None):
+    return {
+        "available_count": len(credits) if available_count is None else available_count,
+        "total_earned_count": len(credits),
+        "credits": list(credits),
+    }
+
+
+def test_selects_earliest_available_non_null_expiry():
+    selected = autoreset.select_earliest_available_credit(
+        _credit_payload(
+            _credit("credit-late", "2026-07-31T00:40:00Z"),
+            _credit("credit-first", "2026-07-18T00:40:00Z"),
+            _credit("credit-middle", "2026-07-27T00:40:00Z"),
+        )
+    )
+
+    assert selected is not None
+    assert selected["id"] == "credit-first"
+
+
+def test_null_expiry_sorts_after_real_expiry():
+    selected = autoreset.select_earliest_available_credit(
+        _credit_payload(
+            _credit("credit-no-expiry", None),
+            _credit("credit-expiring", "2026-07-18T00:40:00Z"),
+        )
+    )
+
+    assert selected is not None
+    assert selected["id"] == "credit-expiring"
+
+
+def test_ignores_redeemed_and_unusable_rows():
+    selected = autoreset.select_earliest_available_credit(
+        _credit_payload(
+            _credit("redeemed", "2026-07-17T00:40:00Z", status="redeemed"),
+            _credit("", "2026-07-16T00:40:00Z"),
+            _credit("usable", None),
+        )
+    )
+
+    assert selected is not None
+    assert selected["id"] == "usable"
+
+
+def test_positive_count_but_no_valid_id_fails_closed():
+    assert (
+        autoreset.select_earliest_available_credit(
+            _credit_payload(
+                _credit("", "2026-07-18T00:40:00Z"), available_count=1
+            )
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"available_count": 1, "credits": "not-a-list"},
+        {"available_count": 1, "credits": ["not-a-row"]},
+        _credit_payload(
+            _credit("malformed-expiry", "not-an-iso-date"), available_count=1
+        ),
+    ],
+)
+def test_malformed_credit_schema_fails_closed(payload):
+    assert autoreset.select_earliest_available_credit(payload) is None
+
+
+def test_malformed_available_row_does_not_hide_another_valid_credit():
+    selected = autoreset.select_earliest_available_credit(
+        _credit_payload(
+            _credit("malformed", "not-an-iso-date"),
+            _credit("valid", "2026-07-18T00:40:00Z"),
+        )
+    )
+
+    assert selected is not None
+    assert selected["id"] == "valid"

@@ -145,6 +145,19 @@ def test_match_provider_mapping(model, expected):
     assert usage._match_provider(model) == expected
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("GPT-5-CODEX", True),
+        ("o4-mini", True),
+        ("claude-opus-4", False),
+        (None, False),
+    ],
+)
+def test_matches_codex_model_is_public_and_case_insensitive(model, expected):
+    assert usage.matches_codex_model(model) is expected
+
+
 def test_get_usage_for_model_dispatches_to_matched_provider(monkeypatch):
     sentinel = {"provider": "MiniMax", "plan_type": None, "windows": {}}
     monkeypatch.setattr(minimax_usage, "get_minimax_usage", lambda: sentinel)
