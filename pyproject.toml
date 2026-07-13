@@ -5,7 +5,7 @@
 # The version below is synchronized with plugin/plugin.yaml by release-please;
 # it is kept here for parity only and is never published (package = false).
 name = "hermes-codex-usage-hook"
-version = "0.2.1" # x-release-please-version
+version = "0.2.2" # x-release-please-version
 requires-python = ">=3.10"
 # Runtime deps pinned to the Hermes host versions so local tests and standalone
 # quick-checks run against the exact versions Hermes provides at plugin load.
