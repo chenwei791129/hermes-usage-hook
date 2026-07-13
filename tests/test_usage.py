@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import pytest
+import httpx
 
 from plugin import usage
 from plugin.hooks import footer_hook
@@ -600,3 +601,148 @@ def test_get_codex_usage_reads_credential_pool_layout(monkeypatch, tmp_path):
     }
     assert usage["provider"] == "Codex"
     assert usage["windows"]["5h"]["used_percent"] == 34
+
+
+# --- Codex rate-limit reset credit transport (offline only) -------------------
+
+
+def _mock_codex_transport(monkeypatch, handler, *, account_id="account-123"):
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        codex_usage,
+        "_load_auth",
+        lambda: {
+            "tokens": {
+                "access_token": "secret-access-token",
+                "account_id": account_id,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        codex_usage.httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(handler), **kwargs
+        ),
+    )
+
+
+def test_list_reset_credits_uses_get_endpoint_and_active_auth(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"available_count": 2})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    assert codex_usage.list_rate_limit_reset_credits() == {"available_count": 2}
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert str(requests[0].url) == codex_usage.RESET_CREDITS_URL
+    assert requests[0].headers["Authorization"] == "Bearer secret-access-token"
+
+
+def test_consume_reset_credit_posts_stable_identifiers(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"status": "reset"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    result = codex_usage.consume_rate_limit_reset_credit("request-uuid", "credit-1")
+
+    assert result == {"status": "reset"}
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == codex_usage.CONSUME_RESET_CREDIT_URL
+    assert json.loads(requests[0].content) == {
+        "redeem_request_id": "request-uuid",
+        "credit_id": "credit-1",
+    }
+
+
+def test_consume_omits_credit_id_only_when_none(monkeypatch):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"status": "reset"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    codex_usage.consume_rate_limit_reset_credit("request-without-credit", None)
+    codex_usage.consume_rate_limit_reset_credit("request-with-empty-credit", "")
+
+    assert bodies == [
+        {"redeem_request_id": "request-without-credit"},
+        {"redeem_request_id": "request-with-empty-credit", "credit_id": ""},
+    ]
+
+
+@pytest.mark.parametrize("operation", ["list", "consume"])
+def test_reset_transport_sends_chatgpt_account_header_when_present(
+    monkeypatch, operation
+):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    _mock_codex_transport(monkeypatch, handler, account_id="active-account")
+
+    if operation == "list":
+        codex_usage.list_rate_limit_reset_credits()
+    else:
+        codex_usage.consume_rate_limit_reset_credit("request-uuid", "credit-1")
+
+    assert requests[0].headers["ChatGPT-Account-Id"] == "active-account"
+
+
+@pytest.mark.parametrize("status_code", [401, 429, 500, 503])
+@pytest.mark.parametrize("operation", ["list", "consume"])
+def test_reset_transport_raises_on_401_429_and_5xx(
+    monkeypatch, status_code, operation
+):
+    def handler(request):
+        return httpx.Response(status_code, json={"error": "rejected"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        if operation == "list":
+            codex_usage.list_rate_limit_reset_credits()
+        else:
+            codex_usage.consume_rate_limit_reset_credit("request-uuid", "credit-1")
+
+
+def test_reset_transport_does_not_retry_post(monkeypatch):
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, json={"error": "try later"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        codex_usage.consume_rate_limit_reset_credit("stable-uuid", "credit-1")
+
+    assert calls == 1
+
+
+def test_provider_errors_do_not_include_bearer_token(monkeypatch):
+    def handler(request):
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    _mock_codex_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        codex_usage.list_rate_limit_reset_credits()
+
+    assert "secret-access-token" not in str(exc_info.value)
+    assert "Bearer" not in str(exc_info.value)

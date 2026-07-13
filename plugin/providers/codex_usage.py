@@ -35,6 +35,10 @@ from pathlib import Path
 import httpx
 
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+RESET_CREDITS_URL = (
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+)
+CONSUME_RESET_CREDIT_URL = f"{RESET_CREDITS_URL}/consume"
 
 HTTP_TIMEOUT = 30.0
 
@@ -140,7 +144,17 @@ def _load_auth() -> dict:
     return _codex_record(json.loads(_auth_path().read_text()))
 
 
-def _call_usage(access_token: str, account_id: str | None) -> dict:
+def _active_auth() -> tuple[str, str | None]:
+    """Return the active access token and optional ChatGPT account identifier."""
+    auth = _load_auth()
+    tokens = auth.get("tokens", {})
+    access_token = tokens.get("access_token") or auth.get("OPENAI_API_KEY")
+    if not access_token:
+        raise RuntimeError("auth.json has no usable access token")
+    return access_token, tokens.get("account_id")
+
+
+def _auth_headers(access_token: str, account_id: str | None) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
@@ -148,10 +162,66 @@ def _call_usage(access_token: str, account_id: str | None) -> dict:
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
+    return headers
+
+
+def _request_json(
+    method: str,
+    url: str,
+    *,
+    access_token: str,
+    account_id: str | None,
+    payload: dict | None = None,
+) -> dict:
+    """Send one authenticated request and return a JSON object without retries."""
+    headers = _auth_headers(access_token, account_id)
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        resp = client.get(USAGE_URL, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        if payload is None:
+            response = client.request(method, url, headers=headers)
+        else:
+            response = client.request(method, url, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+    if not isinstance(result, dict):
+        raise RuntimeError("Codex backend returned a non-object JSON response")
+    return result
+
+
+def _call_usage(access_token: str, account_id: str | None) -> dict:
+    return _request_json(
+        "GET",
+        USAGE_URL,
+        access_token=access_token,
+        account_id=account_id,
+    )
+
+
+def list_rate_limit_reset_credits() -> dict:
+    """GET the detailed reset-credit collection using active Codex OAuth."""
+    access_token, account_id = _active_auth()
+    return _request_json(
+        "GET",
+        RESET_CREDITS_URL,
+        access_token=access_token,
+        account_id=account_id,
+    )
+
+
+def consume_rate_limit_reset_credit(
+    redeem_request_id: str, credit_id: str | None
+) -> dict:
+    """POST one idempotent consume attempt; never generate or retry IDs here."""
+    access_token, account_id = _active_auth()
+    payload = {"redeem_request_id": redeem_request_id}
+    if credit_id is not None:
+        payload["credit_id"] = credit_id
+    return _request_json(
+        "POST",
+        CONSUME_RESET_CREDIT_URL,
+        access_token=access_token,
+        account_id=account_id,
+        payload=payload,
+    )
 
 
 def _label_window(seconds: int) -> str:
