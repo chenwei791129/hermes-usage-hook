@@ -131,4 +131,7 @@ def format_summary(usage: dict) -> str:
     plan_type = usage.get("plan_type")
     if plan_type:
         lines[0] += f" | plan {plan_type}"
+    reset_credits_available = usage.get("reset_credits_available")
+    if reset_credits_available is not None:
+        lines[0] += f" | reset credits {reset_credits_available}"
     return "\n".join(lines)

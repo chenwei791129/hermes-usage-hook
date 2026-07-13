@@ -36,6 +36,7 @@ def test_codex_normalize_tags_provider():
         },
         "plan_type": "pro",
         "credits": {"balance": 5},
+        "rate_limit_reset_credits": {"available_count": 3},
     }
 
     usage = codex_usage._normalize(raw)
@@ -44,6 +45,7 @@ def test_codex_normalize_tags_provider():
     assert usage["plan_type"] == "pro"
     assert usage["windows"]["5h"]["used_percent"] == 42
     assert usage["windows"]["5h"]["remaining_percent"] == 58
+    assert usage["reset_credits_available"] == 3
 
 
 # --- MiniMax token resolution (Resolve the MiniMax API token) -----------------
@@ -234,6 +236,7 @@ def test_format_summary_falls_back_to_weekly_when_5h_is_absent():
     usage_dict = {
         "provider": "Codex",
         "plan_type": "plus",
+        "reset_credits_available": 3,
         "windows": {
             "weekly": {
                 "used_percent": 10,
@@ -244,7 +247,22 @@ def test_format_summary_falls_back_to_weekly_when_5h_is_absent():
     }
 
     assert usage.format_summary(usage_dict) == (
-        "Codex weekly | used 10%, left 90% (resets in 6d4h) | plan plus"
+        "Codex weekly | used 10%, left 90% (resets in 6d4h) | plan plus | reset credits 3"
+    )
+
+
+def test_format_summary_includes_zero_reset_credits():
+    usage_dict = {
+        "provider": "Codex",
+        "plan_type": "plus",
+        "reset_credits_available": 0,
+        "windows": {
+            "weekly": {"used_percent": 10, "remaining_percent": 90},
+        },
+    }
+
+    assert usage.format_summary(usage_dict) == (
+        "Codex weekly | used 10%, left 90% | plan plus | reset credits 0"
     )
 
 
