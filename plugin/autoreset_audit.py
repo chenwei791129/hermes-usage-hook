@@ -62,6 +62,22 @@ def _credits(value: object) -> int | None:
     return value
 
 
+def coerce_percentage(value: object) -> int | float | None:
+    """Return the value when it passes the percentage rules, else None."""
+    try:
+        return _percentage(value)
+    except ValueError:
+        return None
+
+
+def coerce_credits(value: object) -> int | None:
+    """Return the value when it passes the credits rules, else None."""
+    try:
+        return _credits(value)
+    except ValueError:
+        return None
+
+
 def _observed_at(value: object) -> str:
     if not isinstance(value, str) or not value.endswith("Z"):
         raise ValueError("observed_at must be an RFC 3339 UTC timestamp")
@@ -79,9 +95,7 @@ def _snapshot(value: object) -> dict:
         raise ValueError("before and after must contain exactly the approved fields")
     snapshot = cast(dict[str, object], value)
     return {
-        "weekly_remaining_percent": _percentage(
-            snapshot["weekly_remaining_percent"]
-        ),
+        "weekly_remaining_percent": _percentage(snapshot["weekly_remaining_percent"]),
         "reset_credits": _credits(snapshot["reset_credits"]),
     }
 
@@ -192,13 +206,14 @@ class AutoResetAuditLog:
     def append_once(self, event: dict) -> bool:
         """Durably append a supported event unless its event ID already exists."""
         normalized = validate_event(event)
-        line = json.dumps(
-            normalized, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8") + b"\n"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600
+        line = (
+            json.dumps(normalized, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
+            + b"\n"
         )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
         try:
             _ensure_owner_only(descriptor, self.path)
             existing = self.path.read_bytes()

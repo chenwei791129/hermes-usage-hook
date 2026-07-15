@@ -19,16 +19,29 @@ from uuid import uuid4
 
 import httpx
 
-from .autoreset_audit import AutoResetAuditLog, build_success_event, validate_event
+from .autoreset_audit import (
+    AutoResetAuditLog,
+    build_success_event,
+    coerce_credits,
+    coerce_percentage,
+    validate_event,
+)
 from .hermes_home import resolve_hermes_home
-from .autoreset_lock import acquire_autoreset_lock
+from .autoreset_lock import (
+    PLUGIN_ID,
+    _lock_identity,
+    _lock_is_stale,
+    _reclaim_stale_lock,
+    _release_owned_lock,
+    _try_create_lock,
+    acquire_autoreset_lock,
+)
 from .providers.codex_usage import (
     consume_rate_limit_reset_credit,
     list_rate_limit_reset_credits,
 )
 from .usage import get_usage_for_model, matches_codex_model
 
-PLUGIN_ID = "hermes-usage-hook"
 ENV_ENABLED = "CODEX_ENABLE_AUTORESET"
 ENV_THRESHOLD = "CODEX_AUTORESET_THRESHOLD"
 
@@ -237,7 +250,6 @@ def select_earliest_available_credit(payload: dict) -> dict | None:
 
 
 STATE_VERSION = 1
-LOCK_STALE_SECONDS = 120.0
 NOTICE_TTL_SECONDS = 24 * 60 * 60
 
 _PENDING_FIELDS = frozenset(
@@ -275,18 +287,10 @@ def _hermes_home() -> Path:
     return resolve_hermes_home()
 
 
-def _snapshot_remaining(value: object) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not math.isfinite(value) or not 0 <= value <= 100:
-        return None
-    return value
-
-
-def _snapshot_credits(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
+# Snapshot coercion applies the audit-schema numeric rules, mapping any
+# invalid value to None instead of raising.
+_snapshot_remaining = coerce_percentage
+_snapshot_credits = coerce_credits
 
 
 def _clean_state(state: dict) -> dict:
@@ -581,14 +585,13 @@ class AutoResetStateStore:
 
 def _drain_audit_outbox(
     *, state: dict, store: AutoResetStateStore, audit_log: Any
-) -> bool:
+) -> None:
     event = state.get("audit_outbox")
     if event is None:
-        return True
+        return
     audit_log.append_once(event)
     state["audit_outbox"] = None
     store.write(state)
-    return True
 
 
 def _is_valid_timestamp(value: object) -> bool:
@@ -637,129 +640,11 @@ def drain_autoreset_outbox(
             if not acquired:
                 return False
             state = state_store.load()
-            _drain_audit_outbox(
-                state=state, store=state_store, audit_log=audit_store
-            )
+            _drain_audit_outbox(state=state, store=state_store, audit_log=audit_store)
         return True
     except Exception:  # noqa: BLE001 - callers preserve normal reply behavior
         logger.warning("auto-reset audit outbox drain failed")
         return False
-
-
-def _lock_metadata(path: Path) -> dict:
-    try:
-        loaded = json.loads((path / "owner.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
-
-
-def _lock_is_stale(path: Path, now: float) -> bool:
-    metadata = _lock_metadata(path)
-    created_at = metadata.get("created_at")
-    if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
-        try:
-            created_at = path.stat().st_mtime
-        except OSError:
-            return False
-    return now - created_at >= LOCK_STALE_SECONDS
-
-
-def _remove_lock_dir(path: Path) -> None:
-    try:
-        (path / "owner.json").unlink()
-    except FileNotFoundError:
-        pass
-    try:
-        path.rmdir()
-    except FileNotFoundError:
-        pass
-
-
-def _lock_identity(path: Path) -> tuple[int, int] | None:
-    """Return filesystem identity so stale reclaim cannot target a replacement."""
-    try:
-        stat_result = path.stat()
-    except OSError:
-        return None
-    return stat_result.st_dev, stat_result.st_ino
-
-
-def _reclaim_guard_path(path: Path) -> Path:
-    return path.with_name(f"{path.name}.reclaim")
-
-
-def _try_create_lock(
-    path: Path, owner: str, now: float, *, ignore_reclaim_guard: bool = False
-) -> bool:
-    guard_path = _reclaim_guard_path(path)
-    if not ignore_reclaim_guard and guard_path.exists():
-        return False
-    try:
-        path.mkdir()
-    except FileExistsError:
-        return False
-    if not ignore_reclaim_guard and guard_path.exists():
-        try:
-            path.rmdir()
-        except OSError:
-            pass
-        return False
-    metadata_path = path / "owner.json"
-    try:
-        descriptor = os.open(metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError:
-        try:
-            _remove_lock_dir(path)
-        except OSError:
-            pass
-        return False
-    return True
-
-
-def _reclaim_stale_lock(
-    path: Path,
-    owner: str,
-    *,
-    expected_identity: tuple[int, int],
-    now: float,
-) -> bool:
-    guard_path = _reclaim_guard_path(path)
-    try:
-        guard_path.mkdir()
-    except (FileExistsError, OSError):
-        return False
-    try:
-        if _lock_identity(path) != expected_identity or not _lock_is_stale(path, now):
-            return False
-        stale_path = path.with_name(f"{path.name}.stale.{os.getpid()}.{owner}")
-        try:
-            os.rename(path, stale_path)
-        except (FileNotFoundError, FileExistsError, OSError):
-            return False
-        try:
-            _remove_lock_dir(stale_path)
-        except OSError:
-            return False
-        return _try_create_lock(path, owner, now, ignore_reclaim_guard=True)
-    finally:
-        try:
-            guard_path.rmdir()
-        except OSError:
-            pass
-
-
-def _release_owned_lock(path: Path, owner: str) -> None:
-    if _lock_metadata(path).get("owner") != owner:
-        return
-    try:
-        _remove_lock_dir(path)
-    except OSError:
-        pass
 
 
 @contextmanager
@@ -845,9 +730,7 @@ def _pending_record(state: dict) -> dict | None:
         return None
     if not isinstance(credit_id, str) or not credit_id:
         return None
-    pending["before_remaining"] = _snapshot_remaining(
-        pending.get("before_remaining")
-    )
+    pending["before_remaining"] = _snapshot_remaining(pending.get("before_remaining"))
     pending["before_credits"] = _snapshot_credits(pending.get("before_credits"))
     return pending
 
@@ -984,9 +867,7 @@ def maybe_autoreset(
                 )
             except Exception:
                 logger.warning("auto-reset audit outbox drain failed")
-                return AutoResetResult(
-                    "error", message="auto-reset audit is pending"
-                )
+                return AutoResetResult("error", message="auto-reset audit is pending")
             if eligibility_result is not None:
                 return eligibility_result
             if state_store.cooldown_active(state, now=now):
@@ -1005,8 +886,10 @@ def maybe_autoreset(
                         before_credits=before_credits,
                     )
 
-            if initial_usage is not None and pending is None and not is_eligible(
-                model=model, usage=initial_usage, config=effective
+            if (
+                initial_usage is not None
+                and pending is None
+                and not is_eligible(model=model, usage=initial_usage, config=effective)
             ):
                 return AutoResetResult(
                     "ineligible",
@@ -1158,7 +1041,9 @@ def maybe_autoreset(
                 candidate = response.get("code") or response.get("status")
                 if isinstance(candidate, str):
                     code = candidate
-                elif candidate is not None or "status" in response or "code" in response:
+                elif (
+                    candidate is not None or "status" in response or "code" in response
+                ):
                     malformed_status = True
             if code in {"reset", "already_redeemed"}:
                 after_usage = None

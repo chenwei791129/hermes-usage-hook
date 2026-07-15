@@ -11,7 +11,12 @@ import pytest
 
 from plugin import autoreset
 from plugin import autoreset_audit
-from plugin.autoreset_audit import AutoResetAuditLog, audit_event_id, build_success_event
+from plugin import autoreset_lock
+from plugin.autoreset_audit import (
+    AutoResetAuditLog,
+    audit_event_id,
+    build_success_event,
+)
 
 
 def _plugin_config(*, enabled=True, threshold=10):
@@ -27,7 +32,9 @@ def _plugin_config(*, enabled=True, threshold=10):
 
 
 def test_config_defaults_disabled_threshold_zero():
-    assert autoreset.load_autoreset_config(env={}, config={}) == autoreset.AutoResetConfig(
+    assert autoreset.load_autoreset_config(
+        env={}, config={}
+    ) == autoreset.AutoResetConfig(
         enabled=False,
         threshold=0,
     )
@@ -263,9 +270,7 @@ def test_ignores_redeemed_and_unusable_rows():
 def test_positive_count_but_no_valid_id_fails_closed():
     assert (
         autoreset.select_earliest_available_credit(
-            _credit_payload(
-                _credit("", "2026-07-18T00:40:00Z"), available_count=1
-            )
+            _credit_payload(_credit("", "2026-07-18T00:40:00Z"), available_count=1)
         )
         is None
     )
@@ -400,9 +405,7 @@ def test_state_uses_hermes_home_and_contains_no_credentials(monkeypatch, tmp_pat
         }
     )
 
-    assert store.path == (
-        tmp_path / "state" / "hermes-usage-hook" / "autoreset.json"
-    )
+    assert store.path == (tmp_path / "state" / "hermes-usage-hook" / "autoreset.json")
     serialized = store.path.read_text()
     for forbidden in (
         "must-not-persist",
@@ -483,16 +486,14 @@ def test_stale_lock_can_be_reclaimed_once(tmp_path):
 def test_stale_reclaimer_never_steals_fresh_replacement(tmp_path):
     lock_path = tmp_path / "state" / autoreset.PLUGIN_ID / "autoreset.lock"
     lock_path.mkdir(parents=True)
-    (lock_path / "owner.json").write_text(
-        '{"owner":"stale-owner","created_at":1000.0}'
-    )
-    observed_identity = autoreset._lock_identity(lock_path)
+    (lock_path / "owner.json").write_text('{"owner":"stale-owner","created_at":1000.0}')
+    observed_identity = autoreset_lock._lock_identity(lock_path)
     assert observed_identity is not None
 
-    autoreset._remove_lock_dir(lock_path)
-    assert autoreset._try_create_lock(lock_path, "fresh-owner", 1_120.0)
+    autoreset_lock._remove_lock_dir(lock_path)
+    assert autoreset_lock._try_create_lock(lock_path, "fresh-owner", 1_120.0)
 
-    reclaimed = autoreset._reclaim_stale_lock(
+    reclaimed = autoreset_lock._reclaim_stale_lock(
         lock_path,
         "reclaimer",
         expected_identity=observed_identity,
@@ -500,7 +501,7 @@ def test_stale_reclaimer_never_steals_fresh_replacement(tmp_path):
     )
 
     assert reclaimed is False
-    assert autoreset._lock_metadata(lock_path)["owner"] == "fresh-owner"
+    assert autoreset_lock._lock_metadata(lock_path)["owner"] == "fresh-owner"
 
 
 def test_cooldown_blocks_until_deadline(tmp_path):
@@ -526,9 +527,7 @@ def test_expired_notice_is_pruned_after_twenty_four_hours(tmp_path):
     assert store.queue_notice("session-a", "expired", now=1_000.0)
 
     assert (
-        store.pop_notice(
-            "session-a", now=1_000.0 + autoreset.NOTICE_TTL_SECONDS + 0.1
-        )
+        store.pop_notice("session-a", now=1_000.0 + autoreset.NOTICE_TTL_SECONDS + 0.1)
         is None
     )
 
@@ -983,9 +982,7 @@ def test_reset_persists_before_post_then_refreshes(tmp_path):
         pytest.param(1.5, id="float"),
     ],
 )
-def test_invalid_refreshed_credit_count_cannot_strand_success(
-    credit_count, tmp_path
-):
+def test_invalid_refreshed_credit_count_cannot_strand_success(credit_count, tmp_path):
     store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
     audit_log = _AuditLog()
     consumer = _Consumer(response={"status": "reset"})
@@ -1534,7 +1531,9 @@ def test_initial_usage_fetch_failure_sets_one_minute_cooldown_and_preserves_stat
 def _http_status_error(status_code):
     request = httpx.Request("POST", "https://chatgpt.com/backend-api/test")
     response = httpx.Response(status_code, request=request)
-    return httpx.HTTPStatusError("backend rejected request", request=request, response=response)
+    return httpx.HTTPStatusError(
+        "backend rejected request", request=request, response=response
+    )
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
@@ -1669,9 +1668,7 @@ def test_non_string_post_consume_status_uses_unknown_cooldown_without_leakage(
             store=store,
             usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
             credit_lister=_Lister(_valid_credit_list()),
-            consumer=_Consumer(
-                response={"status": status_value, "prompt": raw_secret}
-            ),
+            consumer=_Consumer(response={"status": status_value, "prompt": raw_secret}),
             uuid_factory=_Uuids("req-non-string-status"),
             lock_factory=_LockFactory(True),
             clock=lambda: 1_000.0,
@@ -1682,9 +1679,7 @@ def test_non_string_post_consume_status_uses_unknown_cooldown_without_leakage(
     assert result.message is None
     assert state["pending"] is None
     assert state["cooldown_reason"] == "unknown"
-    assert state["cooldown_until"] == (
-        1_000.0 + autoreset.COOLDOWN_EXHAUSTED_SECONDS
-    )
+    assert state["cooldown_until"] == (1_000.0 + autoreset.COOLDOWN_EXHAUSTED_SECONDS)
     assert raw_secret not in caplog.text
     assert raw_secret not in repr(result)
 
@@ -1862,9 +1857,9 @@ def test_terminal_success_write_atomically_contains_audit_notice(monkeypatch, tm
     assert queue_calls == []
     assert len(terminal_writes) == 1
     assert terminal_writes[0]["pending"] is None
-    assert terminal_writes[0]["fallback_notices"]["sess-atomic"][
-        "message"
-    ].startswith("Codex auto reset")
+    assert terminal_writes[0]["fallback_notices"]["sess-atomic"]["message"].startswith(
+        "Codex auto reset"
+    )
 
 
 def test_failed_atomic_terminal_write_preserves_pending_for_safe_retry(
