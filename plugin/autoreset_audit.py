@@ -8,9 +8,10 @@ import math
 import os
 import re
 from datetime import datetime, timezone
-from importlib import import_module
 from pathlib import Path
 from typing import cast
+
+from .hermes_home import resolve_hermes_home
 
 AUDIT_SCHEMA_VERSION = 1
 AUDIT_EVENT_TYPE = "codex_autoreset_succeeded"
@@ -159,12 +160,6 @@ def build_success_event(
     )
 
 
-def _hermes_home() -> Path:
-    """Resolve the active profile lazily so this module stays standalone-safe."""
-    constants = import_module("hermes_constants")
-    return Path(constants.get_hermes_home())
-
-
 def _write_all(descriptor: int, data: bytes) -> None:
     remaining = memoryview(data)
     while remaining:
@@ -187,29 +182,50 @@ class AutoResetAuditLog:
     """Profile-scoped append-only JSONL storage for successful reset events."""
 
     def __init__(self, *, home: Path | None = None) -> None:
-        self.home = Path(home) if home is not None else _hermes_home()
+        self.home = resolve_hermes_home(home)
         self.path = self.home / "logs" / AUDIT_FILENAME
 
     def append_once(self, event: dict) -> bool:
         """Durably append a supported event unless its event ID already exists."""
         normalized = validate_event(event)
-        events, _ = self.read_events()
-        if any(item["event_id"] == normalized["event_id"] for item in events):
-            return False
-
         line = json.dumps(
             normalized, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8") + b"\n"
-        existing = self.path.read_bytes() if self.path.exists() else b""
-        needs_delimiter = bool(existing) and not existing.endswith(b"\n")
-        payload = (b"\n" if needs_delimiter else b"") + line
-
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
             self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600
         )
         try:
             _ensure_owner_only(descriptor, self.path)
+            existing = self.path.read_bytes()
+            raw_lines = existing.splitlines()
+            trailing = None
+            if existing and not existing.endswith(b"\n"):
+                trailing = raw_lines.pop()
+
+            for raw_line in raw_lines:
+                try:
+                    candidate = validate_event(json.loads(raw_line))
+                except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if candidate["event_id"] == normalized["event_id"]:
+                    os.fsync(descriptor)
+                    return False
+
+            if trailing is not None:
+                try:
+                    candidate = validate_event(json.loads(trailing))
+                except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+                    candidate = None
+                if (
+                    candidate is not None
+                    and candidate["event_id"] == normalized["event_id"]
+                ):
+                    _write_all(descriptor, b"\n")
+                    os.fsync(descriptor)
+                    return False
+
+            payload = (b"\n" if trailing is not None else b"") + line
             _write_all(descriptor, payload)
             os.fsync(descriptor)
         finally:

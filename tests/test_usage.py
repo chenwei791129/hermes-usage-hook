@@ -23,6 +23,7 @@ import yaml
 import install
 from plugin import autoreset, autoreset_cli
 from plugin import usage
+from plugin.autoreset_audit import build_success_event
 from plugin.hooks import footer_hook
 from plugin.providers import codex_usage, minimax_usage
 
@@ -438,6 +439,87 @@ def test_pre_llm_passes_pre_llm_trigger(monkeypatch):
     footer_hook.codex_autoreset_preflight(model="gpt-5-codex")
 
     assert captured["trigger"] == "pre_llm_call"
+
+
+def _seed_footer_outbox(home):
+    event = build_success_event(
+        redeem_request_id="footer-outbox",
+        observed_at=1_000.0,
+        backend_status="reset",
+        trigger="pre_llm_call",
+        before_remaining=0,
+        after_remaining=100,
+        before_credits=3,
+        after_credits=2,
+    )
+    store = autoreset.AutoResetStateStore(home=home, clock=lambda: 1_000.0)
+    store.write({"pending": None, "audit_outbox": event})
+    return store, event
+
+
+def test_footer_drains_seeded_outbox_before_usage_transport(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store, event = _seed_footer_outbox(tmp_path)
+    order = []
+
+    class RecordingAudit:
+        def append_once(self, candidate):
+            order.append("append")
+            assert candidate == event
+            return True
+
+    def usage_transport(_model):
+        order.append("usage")
+        return _codex_usage()
+
+    monkeypatch.setattr(autoreset, "AutoResetAuditLog", lambda **_kwargs: RecordingAudit())
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", usage_transport)
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("disabled"),
+    )
+
+    result = footer_hook.append_usage_footer("reply", model="gpt-5-codex")
+
+    assert result is not None
+    assert order == ["append", "usage"]
+    assert store.load()["audit_outbox"] is None
+
+
+def test_footer_failed_outbox_drain_blocks_usage_transport_and_preserves_reply(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store, event = _seed_footer_outbox(tmp_path)
+    order = []
+
+    class FailingAudit:
+        def append_once(self, candidate):
+            order.append("append")
+            assert candidate == event
+            raise OSError("raw-secret-must-not-leak")
+
+    def forbidden_usage(_model):
+        raise AssertionError("usage transport ran before outbox drain")
+
+    monkeypatch.setattr(autoreset, "AutoResetAuditLog", lambda **_kwargs: FailingAudit())
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", forbidden_usage)
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("coordinator ran after failed pre-usage drain")
+        ),
+    )
+
+    result = footer_hook.append_usage_footer("reply", model="gpt-5-codex")
+
+    assert result is None
+    assert order == ["append"]
+    assert store.load()["audit_outbox"] == event
 
 
 def test_footer_passes_existing_usage_to_coordinator(monkeypatch):

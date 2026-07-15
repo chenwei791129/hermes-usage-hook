@@ -20,6 +20,7 @@ from uuid import uuid4
 import httpx
 
 from .autoreset_audit import AutoResetAuditLog, build_success_event, validate_event
+from .hermes_home import resolve_hermes_home
 from .autoreset_lock import acquire_autoreset_lock
 from .providers.codex_usage import (
     consume_rate_limit_reset_credit,
@@ -270,8 +271,8 @@ class CorruptStateError(RuntimeError):
 
 
 def _hermes_home() -> Path:
-    """Return the active profile's Hermes home without importing Hermes."""
-    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    """Return Hermes' authoritative active profile home lazily."""
+    return resolve_hermes_home()
 
 
 def _snapshot_remaining(value: object) -> int | float | None:
@@ -590,6 +591,56 @@ def _drain_audit_outbox(
     return True
 
 
+def _is_valid_timestamp(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        if not math.isfinite(value):
+            return False
+        datetime.fromtimestamp(float(value), timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return False
+    return True
+
+
+def _observed_timestamp(clock: Callable[[], float], fallback: float) -> float:
+    try:
+        candidate = clock()
+    except Exception:  # noqa: BLE001 - terminal success must remain total-safe
+        return fallback
+    return candidate if _is_valid_timestamp(candidate) else fallback
+
+
+def drain_autoreset_outbox(
+    *,
+    store: Any = None,
+    audit_log: Any = None,
+    lock_factory: Callable[[], AbstractContextManager[bool]] | None = None,
+    clock: Callable[[], float] = time.time,
+) -> bool:
+    """Drain only the durable audit outbox under the coordinator lock."""
+    try:
+        state_store = store or AutoResetStateStore(clock=clock)
+        audit_store = audit_log or AutoResetAuditLog(home=state_store.home)
+        now = clock()
+        if not _is_valid_timestamp(now):
+            return False
+        make_lock = lock_factory or (
+            lambda: acquire_autoreset_lock(home=state_store.home, now=now)
+        )
+        with make_lock() as acquired:
+            if not acquired:
+                return False
+            state = state_store.load()
+            _drain_audit_outbox(
+                state=state, store=state_store, audit_log=audit_store
+            )
+        return True
+    except Exception:  # noqa: BLE001 - callers preserve normal reply behavior
+        logger.warning("auto-reset audit outbox drain failed")
+        return False
+
+
 def _lock_metadata(path: Path) -> dict:
     try:
         loaded = json.loads((path / "owner.json").read_text(encoding="utf-8"))
@@ -841,12 +892,15 @@ def maybe_autoreset(
     del turn_id  # Reserved for future non-sensitive audit correlation.
     try:
         effective = config if config is not None else load_autoreset_config()
+        eligibility_result = None
         if not effective.valid:
-            return AutoResetResult("invalid_config", message=effective.error)
-        if not effective.enabled:
-            return AutoResetResult("disabled")
-        if not matches_codex_model(model):
-            return AutoResetResult("not_codex")
+            eligibility_result = AutoResetResult(
+                "invalid_config", message=effective.error
+            )
+        elif not effective.enabled:
+            eligibility_result = AutoResetResult("disabled")
+        elif not matches_codex_model(model):
+            eligibility_result = AutoResetResult("not_codex")
         if trigger not in {"pre_llm_call", "transform_llm_output", "unknown"}:
             trigger = "unknown"
 
@@ -863,18 +917,17 @@ def maybe_autoreset(
 
         initial_usage = usage
         now = clock()
-        try:
-            valid_now = (
-                not isinstance(now, bool)
-                and isinstance(now, (int, float))
-                and math.isfinite(now)
-            )
-            if valid_now:
-                datetime.fromtimestamp(now, timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            valid_now = False
-        if not valid_now:
+        if not _is_valid_timestamp(now):
             return AutoResetResult("error", message="auto-reset clock is invalid")
+
+        state_path = getattr(state_store, "path", None)
+        try:
+            state_exists = state_path is None or Path(state_path).exists()
+        except OSError:
+            state_exists = True
+        if eligibility_result is not None and not state_exists:
+            return eligibility_result
+
         before_remaining = None
         before_credits = None
         if initial_usage is not None:
@@ -884,7 +937,9 @@ def maybe_autoreset(
             before_credits = _usage_credit_count(initial_usage)
             prelock_state = state_store.load()
             prelock_pending = _pending_record(prelock_state)
-            force_lock_for_outbox = prelock_state.get("audit_outbox") is not None
+            force_lock_for_outbox = (
+                state_exists or prelock_state.get("audit_outbox") is not None
+            )
             if not force_lock_for_outbox and state_store.cooldown_active(
                 prelock_state, now=now
             ):
@@ -931,6 +986,8 @@ def maybe_autoreset(
                 return AutoResetResult(
                     "error", message="auto-reset audit is pending"
                 )
+            if eligibility_result is not None:
+                return eligibility_result
             if state_store.cooldown_active(state, now=now):
                 return AutoResetResult(
                     "cooldown",
@@ -946,6 +1003,15 @@ def maybe_autoreset(
                         before_remaining=before_remaining,
                         before_credits=before_credits,
                     )
+
+            if initial_usage is not None and pending is None and not is_eligible(
+                model=model, usage=initial_usage, config=effective
+            ):
+                return AutoResetResult(
+                    "ineligible",
+                    before_remaining=before_remaining,
+                    before_credits=before_credits,
+                )
 
             if initial_usage is None:
                 try:
@@ -1084,10 +1150,15 @@ def maybe_autoreset(
                 )
 
             code = None
+            malformed_status = False
             if isinstance(response, dict):
                 # Coalesce so a JSON-null "code" still falls back to "status";
                 # dict.get's default only fires when the key is absent.
-                code = response.get("code") or response.get("status")
+                candidate = response.get("code") or response.get("status")
+                if isinstance(candidate, str):
+                    code = candidate
+                elif candidate is not None or "status" in response or "code" in response:
+                    malformed_status = True
             if code in {"reset", "already_redeemed"}:
                 after_usage = None
                 after_remaining = None
@@ -1109,7 +1180,7 @@ def maybe_autoreset(
                 )
                 state["audit_outbox"] = build_success_event(
                     redeem_request_id=request_id,
-                    observed_at=now,
+                    observed_at=_observed_timestamp(clock, now),
                     backend_status=code,
                     trigger=trigger,
                     before_remaining=before_remaining,
@@ -1168,7 +1239,7 @@ def maybe_autoreset(
                 now=now,
                 seconds=COOLDOWN_EXHAUSTED_SECONDS,
                 reason="unknown",
-                clear_pending=False,
+                clear_pending=malformed_status,
             )
             state_store.write(state)
             return AutoResetResult(

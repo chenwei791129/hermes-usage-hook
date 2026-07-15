@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from .autoreset_audit import AutoResetAuditLog
+from .hermes_home import resolve_hermes_home
 from .autoreset_lock import acquire_autoreset_lock
 
 _DURATION_PATTERN = re.compile(r"([1-9][0-9]*)([smhd])\Z")
@@ -79,17 +78,13 @@ def _human_line(event: dict) -> str:
     )
 
 
-def _active_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
-
-
 def usage_hook_command(args: argparse.Namespace) -> int:
     """Read and render local audit history while holding the coordinator lock."""
     if getattr(args, "usage_hook_action", None) != "history":
         print("usage-hook: error: history subcommand required", file=sys.stderr)
         return 2
 
-    home = _active_home()
+    home = resolve_hermes_home()
     try:
         with acquire_autoreset_lock(home=home) as acquired:
             if not acquired:

@@ -11,7 +11,7 @@ from typing import cast
 
 import pytest
 
-from plugin import autoreset_audit
+from plugin import autoreset_audit, hermes_home
 from plugin.autoreset_audit import (
     AUDIT_EVENT_TYPE,
     AUDIT_SCHEMA_VERSION,
@@ -281,6 +281,57 @@ def test_valid_json_without_trailing_newline_is_malformed_and_preserved(tmp_path
     assert store.read_events() == ([unterminated_event, next_event], 0)
 
 
+def test_retry_of_complete_same_event_missing_only_newline_finishes_once(
+    monkeypatch, tmp_path
+):
+    store = AutoResetAuditLog(home=tmp_path)
+    store.path.parent.mkdir(parents=True)
+    event = _success_event(redeem_request_id="same-event-crash")
+    unterminated = _compact_line(event).removesuffix(b"\n")
+    store.path.write_bytes(unterminated)
+    real_fsync = os.fsync
+    fsyncs = []
+
+    def recording_fsync(descriptor):
+        fsyncs.append(descriptor)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(autoreset_audit.os, "fsync", recording_fsync)
+
+    assert store.read_events() == ([], 1)
+    assert store.append_once(event) is False
+
+    assert store.path.read_bytes() == _compact_line(event)
+    assert store.read_events() == ([event], 0)
+    assert len(fsyncs) == 1
+
+
+def test_visible_matching_line_retries_fsync_before_dedup_success(
+    monkeypatch, tmp_path
+):
+    store = AutoResetAuditLog(home=tmp_path)
+    event = _success_event(redeem_request_id="fsync-retry")
+    real_fsync = os.fsync
+    attempts = 0
+
+    def fail_once(descriptor):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("simulated fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(autoreset_audit.os, "fsync", fail_once)
+
+    with pytest.raises(OSError, match="simulated fsync failure"):
+        store.append_once(event)
+    assert store.path.read_bytes() == _compact_line(event)
+
+    assert store.append_once(event) is False
+    assert attempts == 2
+    assert store.read_events() == ([event], 0)
+
+
 @pytest.mark.skipif(
     os.name != "posix" or not hasattr(os, "fchmod"),
     reason="owner-only POSIX mode enforcement is unavailable",
@@ -392,9 +443,24 @@ def test_default_path_uses_injected_profile_home_logs_directory(monkeypatch, tmp
         assert name == "hermes_constants"
         return fake_constants
 
-    monkeypatch.setattr(autoreset_audit, "import_module", fake_import)
+    monkeypatch.setattr(hermes_home, "import_module", fake_import)
 
     store = AutoResetAuditLog()
 
     assert imported == ["hermes_constants"]
+    assert store.path == tmp_path / "logs" / "hermes-usage-hook-autoreset.jsonl"
+
+
+def test_profile_home_falls_back_to_explicit_env_without_hermes_constants(
+    monkeypatch, tmp_path
+):
+    def missing_constants(name):
+        raise ModuleNotFoundError(name=name)
+
+    monkeypatch.setattr(hermes_home, "import_module", missing_constants)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    store = AutoResetAuditLog()
+
+    assert store.home == tmp_path
     assert store.path == tmp_path / "logs" / "hermes-usage-hook-autoreset.jsonl"

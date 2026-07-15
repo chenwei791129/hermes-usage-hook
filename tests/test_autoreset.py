@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import os
 
 import httpx
 import pytest
 
 from plugin import autoreset
-from plugin.autoreset_audit import audit_event_id, build_success_event
+from plugin import autoreset_audit
+from plugin.autoreset_audit import AutoResetAuditLog, audit_event_id, build_success_event
 
 
 def _plugin_config(*, enabled=True, threshold=10):
@@ -717,6 +719,91 @@ def test_disabled_returns_before_any_network_or_state_mutation(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("config", "model", "expected_status"),
+    [
+        (
+            autoreset.AutoResetConfig(enabled=False, threshold=10),
+            "gpt-5-codex",
+            "disabled",
+        ),
+        (
+            autoreset.AutoResetConfig(
+                enabled=False, threshold=0, valid=False, error="bad config"
+            ),
+            "gpt-5-codex",
+            "invalid_config",
+        ),
+        (_enabled_config(threshold=10), "claude-sonnet", "not_codex"),
+    ],
+)
+def test_existing_outbox_drains_before_eligibility_exit(
+    config, model, expected_status, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    event = _audit_event(redeem_request_id=f"{expected_status}-event")
+    store.write({"pending": None, "audit_outbox": event})
+    audit_log = _AuditLog()
+
+    result = autoreset.maybe_autoreset(
+        model=model,
+        usage=_eligible_usage(remaining=5),
+        audit_log=audit_log,
+        config=config,
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == expected_status
+    assert audit_log.events == [event]
+    assert store.load()["audit_outbox"] is None
+
+
+@pytest.mark.parametrize(
+    ("config", "model"),
+    [
+        (autoreset.AutoResetConfig(enabled=False, threshold=10), "gpt-5-codex"),
+        (
+            autoreset.AutoResetConfig(
+                enabled=False, threshold=0, valid=False, error="bad config"
+            ),
+            "gpt-5-codex",
+        ),
+        (_enabled_config(threshold=10), "claude-sonnet"),
+    ],
+)
+def test_failed_outbox_drain_blocks_eligibility_exit_without_network(
+    config, model, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    event = _audit_event(redeem_request_id="blocked-exit")
+    store.write({"pending": None, "audit_outbox": event})
+
+    result = autoreset.maybe_autoreset(
+        model=model,
+        usage=_eligible_usage(remaining=5),
+        audit_log=_AuditLog(error=OSError("audit unavailable")),
+        config=config,
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result == autoreset.AutoResetResult(
+        "error", message="auto-reset audit is pending"
+    )
+    assert store.load()["audit_outbox"] == event
+
+
+@pytest.mark.parametrize(
     "clock_value",
     [
         pytest.param(float("nan"), id="nan"),
@@ -775,6 +862,30 @@ def test_above_threshold_does_not_lock_or_list_credits(tmp_path):
 
     assert result.status == "ineligible"
     assert not store.path.exists()
+
+
+def test_existing_clean_state_and_supplied_ineligible_usage_avoid_transport(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    store.write(autoreset.AutoResetStateStore.empty())
+    state_before = store.path.read_bytes()
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=50, credits=2),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result == autoreset.AutoResetResult(
+        "ineligible", before_remaining=50, before_credits=2
+    )
+    assert store.path.read_bytes() == state_before
 
 
 def test_eligible_path_rechecks_usage_inside_lock(tmp_path):
@@ -910,7 +1021,7 @@ def test_invalid_refreshed_credit_count_cannot_strand_success(
         credit_lister=_never,
         consumer=consumer,
         uuid_factory=_never,
-        lock_factory=_never,
+        lock_factory=_LockFactory(True),
         clock=lambda: 1_001.0,
     )
 
@@ -964,7 +1075,7 @@ def test_success_cooldown_blocks_sequential_consume_on_stale_usage(tmp_path):
         credit_lister=_never,
         consumer=consumer,
         uuid_factory=_never,
-        lock_factory=_never,
+        lock_factory=_LockFactory(True),
         clock=lambda: 1_001.0,
     )
 
@@ -974,6 +1085,50 @@ def test_success_cooldown_blocks_sequential_consume_on_stale_usage(tmp_path):
     state = store.load()
     assert state["cooldown_reason"] == "success"
     assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_SUCCESS_SECONDS
+
+
+def test_default_audit_drain_allows_success_then_cooldown_with_injected_store(
+    tmp_path,
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    consumer = _Consumer(response={"status": "reset"})
+
+    first = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=consumer,
+        uuid_factory=_Uuids("req-default-audit"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+    second = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=consumer,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_001.0,
+    )
+
+    events, malformed = AutoResetAuditLog(home=tmp_path).read_events()
+    assert first.status == "reset"
+    assert second.status == "cooldown"
+    assert malformed == 0
+    assert [event["event_id"] for event in events] == [
+        audit_event_id("req-default-audit")
+    ]
+    assert consumer.calls == [("req-default-audit", "credit-1")]
 
 
 def test_post_timeout_preserves_pending_attempt(tmp_path):
@@ -1022,7 +1177,7 @@ def test_future_retry_after_blocks_without_new_uuid_or_post(tmp_path):
     )
 
     assert result.status == "cooldown"
-    assert lock_factory.calls == 0
+    assert lock_factory.calls == 1
     assert uuids.calls == 0
     pending = store.load()["pending"]
     assert pending["redeem_request_id"] == "req-1"
@@ -1490,10 +1645,126 @@ def test_unknown_or_malformed_response_fails_closed(tmp_path):
     assert pending["status"] == "pending"
 
 
+@pytest.mark.parametrize(
+    "status_value",
+    [
+        pytest.param([], id="list"),
+        pytest.param({}, id="dict"),
+        pytest.param(None, id="null"),
+        pytest.param(True, id="bool"),
+        pytest.param(7, id="number"),
+    ],
+)
+def test_non_string_post_consume_status_uses_unknown_cooldown_without_leakage(
+    status_value, tmp_path, caplog
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    raw_secret = "prompt-body-must-not-leak"
+
+    with caplog.at_level("WARNING"):
+        result = autoreset.maybe_autoreset(
+            model="gpt-5-codex",
+            usage=_eligible_usage(remaining=5),
+            config=_enabled_config(threshold=10),
+            store=store,
+            usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+            credit_lister=_Lister(_valid_credit_list()),
+            consumer=_Consumer(
+                response={"status": status_value, "prompt": raw_secret}
+            ),
+            uuid_factory=_Uuids("req-non-string-status"),
+            lock_factory=_LockFactory(True),
+            clock=lambda: 1_000.0,
+        )
+
+    state = store.load()
+    assert result.status == "unknown"
+    assert result.message is None
+    assert state["pending"] is None
+    assert state["cooldown_reason"] == "unknown"
+    assert state["cooldown_until"] == (
+        1_000.0 + autoreset.COOLDOWN_EXHAUSTED_SECONDS
+    )
+    assert raw_secret not in caplog.text
+    assert raw_secret not in repr(result)
+
+
+class _SequenceClock:
+    def __init__(self, *values):
+        self.values = list(values)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.values.pop(0)
+
+
+@pytest.mark.parametrize("status", ["reset", "already_redeemed"])
+def test_success_observed_at_is_sampled_after_terminal_response(status, tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    audit_log = _AuditLog()
+    clock = _SequenceClock(1_000.0, 1_234.5)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        audit_log=audit_log,
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": status}),
+        uuid_factory=_Uuids("req-observation-clock"),
+        lock_factory=_LockFactory(True),
+        clock=clock,
+    )
+
+    assert result.status == status
+    assert audit_log.events[0]["observed_at"] == "1970-01-01T00:20:34.500000Z"
+    assert clock.calls == 2
+
+
+@pytest.mark.parametrize(
+    "invalid_terminal_time",
+    [float("nan"), float("inf"), True, "bad", 10**100],
+)
+def test_invalid_terminal_clock_falls_back_without_stranding_success(
+    invalid_terminal_time, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    audit_log = _AuditLog()
+    clock = _SequenceClock(1_000.0, invalid_terminal_time)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        audit_log=audit_log,
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "reset"}),
+        uuid_factory=_Uuids("req-clock-fallback"),
+        lock_factory=_LockFactory(True),
+        clock=clock,
+    )
+
+    assert result.status == "reset"
+    assert audit_log.events[0]["observed_at"] == "1970-01-01T00:16:40Z"
+    assert store.load()["pending"] is None
+    assert clock.calls == 2
+
+
 def test_two_contenders_cause_one_logical_consume(tmp_path):
     store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
     consumer = _Consumer(response={"status": "already_redeemed"})
-    lock_factory = _LockFactory(True, False)
+    lock_factory = _LockFactory(True, True)
 
     def run():
         return autoreset.maybe_autoreset(
@@ -1514,7 +1785,7 @@ def test_two_contenders_cause_one_logical_consume(tmp_path):
 
     assert first.status == "already_redeemed"
     assert second.status == "cooldown"
-    assert lock_factory.calls == 1
+    assert lock_factory.calls == 2
     assert len(consumer.calls) == 1
 
 
@@ -1926,6 +2197,52 @@ def test_unresolved_outbox_prevents_new_consume(tmp_path):
     )
     assert consumer.calls == []
     assert store.load()["audit_outbox"] == event
+
+
+def test_repeated_audit_fsync_failure_keeps_outbox_and_retries_sync(
+    monkeypatch, tmp_path
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    event = _audit_event(redeem_request_id="durability-retry")
+    store.write({"pending": None, "audit_outbox": event})
+    audit_log = AutoResetAuditLog(home=tmp_path)
+    real_fsync = os.fsync
+    audit_syncs = 0
+
+    def fail_audit_fsync(descriptor):
+        nonlocal audit_syncs
+        if (
+            audit_log.path.exists()
+            and os.fstat(descriptor).st_ino == audit_log.path.stat().st_ino
+        ):
+            audit_syncs += 1
+            raise OSError("audit fsync unavailable")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(autoreset_audit.os, "fsync", fail_audit_fsync)
+
+    for _ in range(2):
+        result = autoreset.maybe_autoreset(
+            model="gpt-5-codex",
+            usage=_eligible_usage(remaining=5),
+            audit_log=audit_log,
+            config=autoreset.AutoResetConfig(enabled=False, threshold=10),
+            store=store,
+            usage_fetcher=_never,
+            credit_lister=_never,
+            consumer=_never,
+            uuid_factory=_never,
+            lock_factory=_LockFactory(True),
+            clock=lambda: 1_000.0,
+        )
+        assert result == autoreset.AutoResetResult(
+            "error", message="auto-reset audit is pending"
+        )
+        assert store.load()["audit_outbox"] == event
+
+    assert audit_syncs == 2
+    assert audit_log.path.read_bytes().count(b"\n") == 1
+    assert audit_log.read_events() == ([event], 0)
 
 
 def test_concurrent_outbox_is_drained_before_initial_usage_fetch(tmp_path):

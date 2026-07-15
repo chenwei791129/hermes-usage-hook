@@ -30,7 +30,7 @@ import logging
 import sys
 
 from .. import autoreset_cli
-from ..autoreset import AutoResetStateStore, maybe_autoreset
+from ..autoreset import AutoResetStateStore, drain_autoreset_outbox, maybe_autoreset
 from ..usage import format_summary, get_usage_for_model
 
 logger = logging.getLogger(__name__)
@@ -91,6 +91,10 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
     try:
         model = kwargs.get("model")
         session_id = kwargs.get("session_id") or ""
+        # Recover a prior successful reset before any provider transport. Keep
+        # this separate from maybe_autoreset so coordinator locks never nest.
+        if not drain_autoreset_outbox():
+            return None
         usage = get_usage_for_model(model)
         if usage is None:
             return None

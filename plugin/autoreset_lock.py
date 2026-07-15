@@ -10,13 +10,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
+from .hermes_home import resolve_hermes_home
+
 PLUGIN_ID = "hermes-usage-hook"
 LOCK_STALE_SECONDS = 120.0
-
-
-def _hermes_home() -> Path:
-    """Return the active profile's Hermes home without importing Hermes."""
-    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
 
 
 def _lock_metadata(path: Path) -> dict:
@@ -140,7 +137,7 @@ def acquire_autoreset_lock(
     *, home: Path | None = None, now: float | None = None
 ) -> Iterator[bool]:
     """Acquire the cross-process lock, reclaiming at most one stale holder."""
-    lock_home = Path(home) if home is not None else _hermes_home()
+    lock_home = resolve_hermes_home(home)
     path = lock_home / "state" / PLUGIN_ID / "autoreset.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = time.time() if now is None else now

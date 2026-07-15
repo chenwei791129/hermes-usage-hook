@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+import types
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import pytest
 
-from plugin import autoreset_cli
+from plugin import autoreset, autoreset_cli, autoreset_lock
 from plugin.autoreset_audit import AutoResetAuditLog, build_success_event
 
 
@@ -318,8 +320,110 @@ def test_cli_handler_never_calls_codex_transport(monkeypatch, tmp_path, capsys):
 
 
 def test_autoreset_and_cli_use_same_lock_primitive():
-    from plugin import autoreset
     from plugin.autoreset_lock import acquire_autoreset_lock
 
     assert autoreset.acquire_autoreset_lock is acquire_autoreset_lock
     assert autoreset_cli.acquire_autoreset_lock is acquire_autoreset_lock
+
+
+def test_all_state_surfaces_use_authoritative_named_profile_without_env(
+    monkeypatch, tmp_path, capsys
+):
+    selected = tmp_path / "profiles" / "named"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_constants",
+        types.SimpleNamespace(get_hermes_home=lambda: selected),
+    )
+
+    state_store = autoreset.AutoResetStateStore(clock=lambda: 1_000.0)
+    audit_store = AutoResetAuditLog()
+
+    assert state_store.home == selected
+    assert audit_store.home == selected
+    with autoreset_lock.acquire_autoreset_lock(now=1_000.0) as acquired:
+        assert acquired
+        assert (
+            selected / "state" / "hermes-usage-hook" / "autoreset.lock"
+        ).is_dir()
+
+    event = _event(31)
+    _write_events(selected, [event])
+    assert _run(["history", "--json"]) == 0
+    assert capsys.readouterr().out == json.dumps(
+        event, separators=(",", ":"), ensure_ascii=False
+    ) + "\n"
+
+
+def test_real_plugin_root_registration_and_cli_handler_make_no_transport_calls(
+    tmp_path
+):
+    event = _event(41)
+    _write_events(tmp_path, [event])
+    script = r'''
+import argparse
+import httpx
+
+import plugin
+from plugin.providers import codex_usage
+
+calls = []
+
+
+def forbidden(*args, **kwargs):
+    calls.append((args, kwargs))
+    raise AssertionError("forbidden auth/transport call")
+
+
+for name in (
+    "_resolve_codex_auth",
+    "get_codex_usage",
+    "list_rate_limit_reset_credits",
+    "consume_rate_limit_reset_credit",
+):
+    if hasattr(codex_usage, name):
+        setattr(codex_usage, name, forbidden)
+for owner in (httpx, httpx.Client):
+    for name in ("get", "post", "request"):
+        if hasattr(owner, name):
+            setattr(owner, name, forbidden)
+
+
+class Context:
+    def __init__(self):
+        self.cli = None
+
+    def register_hook(self, *_args, **_kwargs):
+        pass
+
+    def register_cli_command(self, **kwargs):
+        self.cli = kwargs
+
+
+ctx = Context()
+plugin.register(ctx)
+assert ctx.cli is not None
+parser = argparse.ArgumentParser(prog="usage-hook")
+ctx.cli["setup_fn"](parser)
+args = parser.parse_args(["history", "--json"])
+assert ctx.cli["handler_fn"](args) == 0
+assert calls == [], calls
+'''
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=__file__.rsplit("/tests/", 1)[0],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == json.dumps(
+        event, separators=(",", ":"), ensure_ascii=False
+    ) + "\n"
+    assert completed.stderr == ""
