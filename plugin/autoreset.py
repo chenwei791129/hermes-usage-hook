@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import tempfile
 import time
@@ -17,6 +19,7 @@ from uuid import uuid4
 
 import httpx
 
+from .autoreset_audit import AutoResetAuditLog, build_success_event, validate_event
 from .providers.codex_usage import (
     consume_rate_limit_reset_credit,
     list_rate_limit_reset_credits,
@@ -29,6 +32,7 @@ ENV_THRESHOLD = "CODEX_AUTORESET_THRESHOLD"
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -246,6 +250,18 @@ _PENDING_FIELDS = frozenset(
         "before_credits",
     }
 )
+_AUDIT_OUTBOX_FIELDS = frozenset(
+    {
+        "schema_version",
+        "event_type",
+        "event_id",
+        "observed_at",
+        "backend_status",
+        "trigger",
+        "before",
+        "after",
+    }
+)
 
 
 class CorruptStateError(RuntimeError):
@@ -257,18 +273,40 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
 
 
+def _snapshot_remaining(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        return None
+    return value
+
+
+def _snapshot_credits(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _clean_state(state: dict) -> dict:
     cleaned: dict = {"version": STATE_VERSION}
 
     pending = state.get("pending")
     if isinstance(pending, dict):
-        cleaned["pending"] = {
+        cleaned_pending: dict[str, object] = {
             key: value
             for key, value in pending.items()
             if key in _PENDING_FIELDS
+            and key not in {"before_remaining", "before_credits"}
             and isinstance(value, (str, int, float))
             and not isinstance(value, bool)
         }
+        cleaned_pending["before_remaining"] = _snapshot_remaining(
+            pending.get("before_remaining")
+        )
+        cleaned_pending["before_credits"] = _snapshot_credits(
+            pending.get("before_credits")
+        )
+        cleaned["pending"] = cleaned_pending
     elif pending is None:
         cleaned["pending"] = None
 
@@ -301,6 +339,21 @@ def _clean_state(state: dict) -> dict:
                     "created_at": created_at,
                 }
     cleaned["fallback_notices"] = cleaned_fallbacks
+
+    if "audit_outbox" in state:
+        audit_outbox = state.get("audit_outbox")
+        if audit_outbox is None:
+            cleaned["audit_outbox"] = None
+        elif isinstance(audit_outbox, dict):
+            candidate = {
+                key: value
+                for key, value in audit_outbox.items()
+                if key in _AUDIT_OUTBOX_FIELDS
+            }
+            try:
+                cleaned["audit_outbox"] = validate_event(candidate)
+            except (TypeError, ValueError):
+                pass
 
     return cleaned
 
@@ -524,6 +577,18 @@ class AutoResetStateStore:
             return message if isinstance(message, str) else None
 
 
+def _drain_audit_outbox(
+    *, state: dict, store: AutoResetStateStore, audit_log: Any
+) -> bool:
+    event = state.get("audit_outbox")
+    if event is None:
+        return True
+    audit_log.append_once(event)
+    state["audit_outbox"] = None
+    store.write(state)
+    return True
+
+
 def _lock_metadata(path: Path) -> dict:
     try:
         loaded = json.loads((path / "owner.json").read_text(encoding="utf-8"))
@@ -719,10 +784,7 @@ class AutoResetResult:
 
 
 def _usage_credit_count(usage: dict) -> int | None:
-    count = usage.get("reset_credits_available")
-    if isinstance(count, bool) or not isinstance(count, int):
-        return None
-    return count
+    return _snapshot_credits(usage.get("reset_credits_available"))
 
 
 def _set_cooldown(
@@ -756,6 +818,10 @@ def _pending_record(state: dict) -> dict | None:
         return None
     if not isinstance(credit_id, str) or not credit_id:
         return None
+    pending["before_remaining"] = _snapshot_remaining(
+        pending.get("before_remaining")
+    )
+    pending["before_credits"] = _snapshot_credits(pending.get("before_credits"))
     return pending
 
 
@@ -789,6 +855,8 @@ def maybe_autoreset(
     usage: dict | None = None,
     session_id: str = "",
     turn_id: str = "",
+    trigger: str = "unknown",
+    audit_log: Any = None,
     config: AutoResetConfig | None = None,
     store: Any = None,
     usage_fetcher: Callable[[], dict] | None = None,
@@ -808,62 +876,68 @@ def maybe_autoreset(
             return AutoResetResult("disabled")
         if not matches_codex_model(model):
             return AutoResetResult("not_codex")
+        if trigger not in {"pre_llm_call", "transform_llm_output", "unknown"}:
+            trigger = "unknown"
 
         fetch_usage = usage_fetcher or (lambda: get_usage_for_model(model) or {})
         list_credits = credit_lister or list_rate_limit_reset_credits
         consume = consumer or consume_rate_limit_reset_credit
         make_uuid = uuid_factory or uuid4
         state_store = store or AutoResetStateStore(clock=clock)
+        audit_store = (
+            audit_log
+            if audit_log is not None
+            else AutoResetAuditLog(home=state_store.home)
+        )
 
         initial_usage = usage
-        if initial_usage is None:
-            now = clock()
-            try:
-                initial_usage = fetch_usage()
-            except Exception as exc:
-                make_lock = lock_factory or (
-                    lambda: acquire_autoreset_lock(home=state_store.home, now=now)
-                )
-                with make_lock() as acquired:
-                    if not acquired:
-                        return AutoResetResult("busy", message=str(exc))
-                    state = state_store.load()
-                    _set_cooldown(
-                        state,
-                        now=now,
-                        seconds=COOLDOWN_RETRY_SECONDS,
-                        reason="transient",
-                        clear_pending=False,
-                    )
-                    state_store.write(state)
-                return AutoResetResult("transient", message=str(exc))
-        if not isinstance(initial_usage, dict):
-            return AutoResetResult("ineligible")
-        before_remaining = weekly_remaining(initial_usage)
-        before_credits = _usage_credit_count(initial_usage)
         now = clock()
-        prelock_state = state_store.load()
-        prelock_pending = _pending_record(prelock_state)
-        if state_store.cooldown_active(prelock_state, now=now):
-            return AutoResetResult(
-                "cooldown",
-                before_remaining=before_remaining,
-                before_credits=before_credits,
+        try:
+            valid_now = (
+                not isinstance(now, bool)
+                and isinstance(now, (int, float))
+                and math.isfinite(now)
             )
-        if prelock_pending is not None:
-            retry_after = prelock_pending.get("retry_after")
-            if isinstance(retry_after, (int, float)) and now < retry_after:
+            if valid_now:
+                datetime.fromtimestamp(now, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            valid_now = False
+        if not valid_now:
+            return AutoResetResult("error", message="auto-reset clock is invalid")
+        before_remaining = None
+        before_credits = None
+        if initial_usage is not None:
+            if not isinstance(initial_usage, dict):
+                return AutoResetResult("ineligible")
+            before_remaining = weekly_remaining(initial_usage)
+            before_credits = _usage_credit_count(initial_usage)
+            prelock_state = state_store.load()
+            prelock_pending = _pending_record(prelock_state)
+            force_lock_for_outbox = prelock_state.get("audit_outbox") is not None
+            if not force_lock_for_outbox and state_store.cooldown_active(
+                prelock_state, now=now
+            ):
                 return AutoResetResult(
                     "cooldown",
                     before_remaining=before_remaining,
                     before_credits=before_credits,
                 )
-        elif not is_eligible(model=model, usage=initial_usage, config=effective):
-            return AutoResetResult(
-                "ineligible",
-                before_remaining=before_remaining,
-                before_credits=before_credits,
-            )
+            if not force_lock_for_outbox and prelock_pending is not None:
+                retry_after = prelock_pending.get("retry_after")
+                if isinstance(retry_after, (int, float)) and now < retry_after:
+                    return AutoResetResult(
+                        "cooldown",
+                        before_remaining=before_remaining,
+                        before_credits=before_credits,
+                    )
+            elif not force_lock_for_outbox and not is_eligible(
+                model=model, usage=initial_usage, config=effective
+            ):
+                return AutoResetResult(
+                    "ineligible",
+                    before_remaining=before_remaining,
+                    before_credits=before_credits,
+                )
 
         make_lock = lock_factory or (
             lambda: acquire_autoreset_lock(home=state_store.home, now=now)
@@ -877,6 +951,15 @@ def maybe_autoreset(
                 )
 
             state = state_store.load()
+            try:
+                _drain_audit_outbox(
+                    state=state, store=state_store, audit_log=audit_store
+                )
+            except Exception:
+                logger.warning("auto-reset audit outbox drain failed")
+                return AutoResetResult(
+                    "error", message="auto-reset audit is pending"
+                )
             if state_store.cooldown_active(state, now=now):
                 return AutoResetResult(
                     "cooldown",
@@ -889,6 +972,32 @@ def maybe_autoreset(
                 if isinstance(retry_after, (int, float)) and now < retry_after:
                     return AutoResetResult(
                         "cooldown",
+                        before_remaining=before_remaining,
+                        before_credits=before_credits,
+                    )
+
+            if initial_usage is None:
+                try:
+                    initial_usage = fetch_usage()
+                except Exception as exc:
+                    _set_cooldown(
+                        state,
+                        now=now,
+                        seconds=COOLDOWN_RETRY_SECONDS,
+                        reason="transient",
+                        clear_pending=False,
+                    )
+                    state_store.write(state)
+                    return AutoResetResult("transient", message=str(exc))
+                if not isinstance(initial_usage, dict):
+                    return AutoResetResult("ineligible")
+                before_remaining = weekly_remaining(initial_usage)
+                before_credits = _usage_credit_count(initial_usage)
+                if pending is None and not is_eligible(
+                    model=model, usage=initial_usage, config=effective
+                ):
+                    return AutoResetResult(
+                        "ineligible",
                         before_remaining=before_remaining,
                         before_credits=before_credits,
                     )
@@ -1027,6 +1136,16 @@ def maybe_autoreset(
                     before_credits=before_credits,
                     after_credits=after_credits,
                 )
+                state["audit_outbox"] = build_success_event(
+                    redeem_request_id=request_id,
+                    observed_at=now,
+                    backend_status=code,
+                    trigger=trigger,
+                    before_remaining=before_remaining,
+                    after_remaining=after_remaining,
+                    before_credits=before_credits,
+                    after_credits=after_credits,
+                )
                 _set_cooldown(
                     state,
                     now=now,
@@ -1037,6 +1156,12 @@ def maybe_autoreset(
                 notice_persisted = state_store.queue_fallback_notice_locked(
                     state, session_id, message, now=now
                 )
+                try:
+                    _drain_audit_outbox(
+                        state=state, store=state_store, audit_log=audit_store
+                    )
+                except Exception:
+                    logger.warning("auto-reset audit outbox drain failed")
                 return AutoResetResult(
                     code,
                     before_remaining=before_remaining,
