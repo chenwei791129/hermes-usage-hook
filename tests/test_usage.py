@@ -18,7 +18,7 @@ import httpx
 import pytest
 import yaml
 
-from plugin import autoreset
+from plugin import autoreset, autoreset_cli
 from plugin import usage
 from plugin.hooks import footer_hook
 from plugin.providers import codex_usage, minimax_usage
@@ -321,9 +321,13 @@ def test_footer_logs_prefixed_error_and_leaves_reply_unchanged(monkeypatch, caps
 class _HookContext:
     def __init__(self):
         self.calls = []
+        self.cli_calls = []
 
     def register_hook(self, hook_name, callback):
         self.calls.append((hook_name, callback))
+
+    def register_cli_command(self, **kwargs):
+        self.cli_calls.append(kwargs)
 
 
 def _codex_usage(*, remaining=10, credits=3):
@@ -348,6 +352,21 @@ def test_register_adds_transform_and_pre_llm_hooks_exactly_once():
     assert ctx.calls == [
         ("transform_llm_output", footer_hook.append_usage_footer),
         ("pre_llm_call", footer_hook.codex_autoreset_preflight),
+    ]
+
+
+def test_register_adds_usage_hook_cli_exactly_once():
+    ctx = _HookContext()
+
+    footer_hook.register(ctx)
+
+    assert ctx.cli_calls == [
+        {
+            "name": "usage-hook",
+            "help": "Inspect hermes-usage-hook state and audit history",
+            "setup_fn": autoreset_cli.register_cli,
+            "handler_fn": autoreset_cli.usage_hook_command,
+        }
     ]
 
 

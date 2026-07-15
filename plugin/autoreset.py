@@ -20,6 +20,7 @@ from uuid import uuid4
 import httpx
 
 from .autoreset_audit import AutoResetAuditLog, build_success_event, validate_event
+from .autoreset_lock import acquire_autoreset_lock
 from .providers.codex_usage import (
     consume_rate_limit_reset_credit,
     list_rate_limit_reset_credits,
@@ -703,36 +704,6 @@ def _release_owned_lock(path: Path, owner: str) -> None:
         _remove_lock_dir(path)
     except OSError:
         pass
-
-
-@contextmanager
-def acquire_autoreset_lock(
-    *, home: Path | None = None, now: float | None = None
-) -> Iterator[bool]:
-    """Acquire the cross-process lock, reclaiming at most one stale holder."""
-    lock_home = Path(home) if home is not None else _hermes_home()
-    path = lock_home / "state" / PLUGIN_ID / "autoreset.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = time.time() if now is None else now
-    owner = str(uuid4())
-    acquired = _try_create_lock(path, owner, timestamp)
-    observed_identity = _lock_identity(path)
-    if (
-        not acquired
-        and observed_identity is not None
-        and _lock_is_stale(path, timestamp)
-    ):
-        acquired = _reclaim_stale_lock(
-            path,
-            owner,
-            expected_identity=observed_identity,
-            now=timestamp,
-        )
-    try:
-        yield acquired
-    finally:
-        if acquired:
-            _release_owned_lock(path, owner)
 
 
 @contextmanager

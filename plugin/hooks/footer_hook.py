@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import sys
 
+from .. import autoreset_cli
 from ..autoreset import AutoResetStateStore, maybe_autoreset
 from ..usage import format_summary, get_usage_for_model
 
@@ -43,6 +44,12 @@ def register(ctx):
     """Hermes plugin entry point."""
     ctx.register_hook("transform_llm_output", append_usage_footer)
     ctx.register_hook("pre_llm_call", codex_autoreset_preflight)
+    ctx.register_cli_command(
+        name="usage-hook",
+        help="Inspect hermes-usage-hook state and audit history",
+        setup_fn=autoreset_cli.register_cli,
+        handler_fn=autoreset_cli.usage_hook_command,
+    )
 
 
 def codex_autoreset_preflight(**kwargs) -> None:
