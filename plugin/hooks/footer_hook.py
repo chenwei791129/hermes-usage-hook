@@ -26,10 +26,13 @@ hook runs, so the rewrite may not take effect, and the footer may not appear.
 
 from __future__ import annotations
 
+import logging
 import sys
 
 from ..autoreset import AutoResetStateStore, maybe_autoreset
 from ..usage import format_summary, get_usage_for_model
+
+logger = logging.getLogger(__name__)
 
 # Coordinator statuses that do no filesystem work and never persist a notice, so
 # the footer can skip the locked notice-store reads entirely for these.
@@ -49,9 +52,10 @@ def codex_autoreset_preflight(**kwargs) -> None:
             model=kwargs.get("model"),
             session_id=kwargs.get("session_id") or "",
             turn_id=kwargs.get("turn_id") or "",
+            trigger="pre_llm_call",
         )
-    except Exception as exc:  # noqa: BLE001 - never break the provider request
-        print(f"[hermes-usage-hook] auto reset skipped: {exc}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 - never break the provider request
+        logger.warning("auto-reset audit evaluation failed")
     return None
 
 
@@ -89,6 +93,7 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
                 model=model,
                 usage=usage,
                 session_id=session_id,
+                trigger="transform_llm_output",
             )
             if reset_result.after_usage is not None:
                 usage = reset_result.after_usage
@@ -103,8 +108,8 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
                 and not reset_result.notice_persisted
             ):
                 notice = reset_result.message
-        except Exception as exc:  # noqa: BLE001 - preserve normal footer behavior
-            print(f"[hermes-usage-hook] auto reset skipped: {exc}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 - preserve normal footer behavior
+            logger.warning("auto-reset audit evaluation failed")
         footer = format_summary(usage)
         if notice:
             footer = f"{footer}\n{notice}"

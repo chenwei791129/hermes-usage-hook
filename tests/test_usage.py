@@ -400,7 +400,22 @@ def test_preflight_passes_session_turn_and_model(monkeypatch):
         "model": "gpt-5-codex",
         "session_id": "sess-2",
         "turn_id": "turn-2",
+        "trigger": "pre_llm_call",
     }
+
+
+def test_pre_llm_passes_pre_llm_trigger(monkeypatch):
+    captured = {}
+
+    def fake_autoreset(**kwargs):
+        captured.update(kwargs)
+        return autoreset.AutoResetResult("disabled")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    footer_hook.codex_autoreset_preflight(model="gpt-5-codex")
+
+    assert captured["trigger"] == "pre_llm_call"
 
 
 def test_footer_passes_existing_usage_to_coordinator(monkeypatch):
@@ -422,6 +437,21 @@ def test_footer_passes_existing_usage_to_coordinator(monkeypatch):
     assert captured["usage"] is existing_usage
     assert captured["model"] == "gpt-5-codex"
     assert captured["session_id"] == "sess-3"
+
+
+def test_footer_passes_transform_trigger(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+
+    def fake_autoreset(**kwargs):
+        captured.update(kwargs)
+        return autoreset.AutoResetResult("ineligible")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
+
+    footer_hook.append_usage_footer("reply", model="gpt-5-codex")
+
+    assert captured["trigger"] == "transform_llm_output"
 
 
 def test_footer_uses_refreshed_usage_after_reset(monkeypatch):
@@ -601,6 +631,45 @@ def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
         "reply\n\n───\n"
         "Codex weekly | used 90%, left 10% | plan plus | reset credits 3"
     )
+
+
+def test_audit_failure_still_returns_original_prompt_and_response(monkeypatch, caplog):
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+
+    def exploding_audit(**_kwargs):
+        raise RuntimeError("audit append failed")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", exploding_audit)
+
+    prompt_result = footer_hook.codex_autoreset_preflight(model="gpt-5-codex")
+    response_result = footer_hook.append_usage_footer("original reply", model="gpt-5-codex")
+
+    assert prompt_result is None
+    assert response_result == (
+        "original reply\n\n───\n"
+        "Codex weekly | used 90%, left 10% | plan plus | reset credits 3"
+    )
+    assert [record.getMessage() for record in caplog.records] == [
+        "auto-reset audit evaluation failed",
+        "auto-reset audit evaluation failed",
+    ]
+
+
+def test_no_raw_identifier_is_printed_to_stderr_on_audit_failure(
+    monkeypatch, capsys
+):
+    raw_identifier = "redeem-request-raw-secret"
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+
+    def exploding_audit(**_kwargs):
+        raise RuntimeError(f"audit append failed for {raw_identifier}")
+
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", exploding_audit)
+
+    footer_hook.codex_autoreset_preflight(model="gpt-5-codex")
+    footer_hook.append_usage_footer("original reply", model="gpt-5-codex")
+
+    assert raw_identifier not in capsys.readouterr().err
 
 
 def test_manifest_declares_exactly_two_supported_hooks():
