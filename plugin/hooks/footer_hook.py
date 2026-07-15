@@ -44,7 +44,12 @@ def register(ctx):
     """Hermes plugin entry point."""
     ctx.register_hook("transform_llm_output", append_usage_footer)
     ctx.register_hook("pre_llm_call", codex_autoreset_preflight)
-    ctx.register_cli_command(
+    register_cli_command = getattr(ctx, "register_cli_command", None)
+    if register_cli_command is None:
+        # Hosts predating CLI plugin support must still get both hooks.
+        logger.warning("host lacks register_cli_command; usage-hook CLI skipped")
+        return
+    register_cli_command(
         name="usage-hook",
         help="Inspect hermes-usage-hook state and audit history",
         setup_fn=autoreset_cli.register_cli,
@@ -61,8 +66,9 @@ def codex_autoreset_preflight(**kwargs) -> None:
             turn_id=kwargs.get("turn_id") or "",
             trigger="pre_llm_call",
         )
-    except Exception:  # noqa: BLE001 - never break the provider request
-        logger.warning("auto-reset audit evaluation failed")
+    except Exception as exc:  # noqa: BLE001 - never break the provider request
+        # Log only the exception type: messages may carry backend payloads.
+        logger.warning("auto-reset audit evaluation failed (%s)", type(exc).__name__)
     return None
 
 
@@ -93,8 +99,9 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
         session_id = kwargs.get("session_id") or ""
         # Recover a prior successful reset before any provider transport. Keep
         # this separate from maybe_autoreset so coordinator locks never nest.
-        if not drain_autoreset_outbox():
-            return None
+        # A failed drain must never suppress the footer; maybe_autoreset
+        # refuses new consume attempts while the outbox is stuck.
+        drain_autoreset_outbox()
         usage = get_usage_for_model(model)
         if usage is None:
             return None
@@ -119,8 +126,11 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
                 and not reset_result.notice_persisted
             ):
                 notice = reset_result.message
-        except Exception:  # noqa: BLE001 - preserve normal footer behavior
-            logger.warning("auto-reset audit evaluation failed")
+        except Exception as exc:  # noqa: BLE001 - preserve normal footer behavior
+            # Log only the exception type: messages may carry backend payloads.
+            logger.warning(
+                "auto-reset audit evaluation failed (%s)", type(exc).__name__
+            )
         footer = format_summary(usage)
         if notice:
             footer = f"{footer}\n{notice}"

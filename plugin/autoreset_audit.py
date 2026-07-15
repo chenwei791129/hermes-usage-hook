@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -13,13 +14,13 @@ from typing import cast
 
 from .hermes_home import resolve_hermes_home
 
+logger = logging.getLogger(__name__)
+
 AUDIT_SCHEMA_VERSION = 1
 AUDIT_EVENT_TYPE = "codex_autoreset_succeeded"
 AUDIT_FILENAME = "hermes-usage-hook-autoreset.jsonl"
 _ALLOWED_STATUSES = frozenset({"reset", "already_redeemed"})
-_ALLOWED_TRIGGERS = frozenset(
-    {"pre_llm_call", "transform_llm_output", "unknown"}
-)
+_ALLOWED_TRIGGERS = frozenset({"pre_llm_call", "transform_llm_output", "unknown"})
 _EVENT_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EVENT_KEYS = frozenset(
     {
@@ -175,7 +176,10 @@ def _ensure_owner_only(descriptor: int, path: Path) -> None:
     except (AttributeError, OSError):
         path.chmod(0o600)
     if os.fstat(descriptor).st_mode & 0o777 != 0o600:
-        raise PermissionError("audit file mode is not owner-only")
+        # chmod reported success but had no effect: this filesystem cannot
+        # represent owner-only modes (the spec requires 0600 only where
+        # supported), so raising here would permanently disable the audit.
+        logger.warning("audit file mode is not owner-only")
 
 
 class AutoResetAuditLog:

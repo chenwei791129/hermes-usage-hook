@@ -1177,7 +1177,7 @@ def test_future_retry_after_blocks_without_new_uuid_or_post(tmp_path):
     )
 
     assert result.status == "cooldown"
-    assert lock_factory.calls == 1
+    assert lock_factory.calls == 0
     assert uuids.calls == 0
     pending = store.load()["pending"]
     assert pending["redeem_request_id"] == "req-1"
@@ -1785,7 +1785,7 @@ def test_two_contenders_cause_one_logical_consume(tmp_path):
 
     assert first.status == "already_redeemed"
     assert second.status == "cooldown"
-    assert lock_factory.calls == 2
+    assert lock_factory.calls == 1
     assert len(consumer.calls) == 1
 
 

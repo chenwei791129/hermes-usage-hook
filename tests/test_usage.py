@@ -457,9 +457,7 @@ def _seed_footer_outbox(home):
     return store, event
 
 
-def test_footer_drains_seeded_outbox_before_usage_transport(
-    monkeypatch, tmp_path
-):
+def test_footer_drains_seeded_outbox_before_usage_transport(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     store, event = _seed_footer_outbox(tmp_path)
     order = []
@@ -474,7 +472,9 @@ def test_footer_drains_seeded_outbox_before_usage_transport(
         order.append("usage")
         return _codex_usage()
 
-    monkeypatch.setattr(autoreset, "AutoResetAuditLog", lambda **_kwargs: RecordingAudit())
+    monkeypatch.setattr(
+        autoreset, "AutoResetAuditLog", lambda **_kwargs: RecordingAudit()
+    )
     monkeypatch.setattr(footer_hook, "get_usage_for_model", usage_transport)
     monkeypatch.setattr(
         footer_hook,
@@ -489,7 +489,7 @@ def test_footer_drains_seeded_outbox_before_usage_transport(
     assert store.load()["audit_outbox"] is None
 
 
-def test_footer_failed_outbox_drain_blocks_usage_transport_and_preserves_reply(
+def test_footer_failed_outbox_drain_keeps_footer_and_preserves_outbox(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -502,23 +502,28 @@ def test_footer_failed_outbox_drain_blocks_usage_transport_and_preserves_reply(
             assert candidate == event
             raise OSError("raw-secret-must-not-leak")
 
-    def forbidden_usage(_model):
-        raise AssertionError("usage transport ran before outbox drain")
+    def usage_transport(_model):
+        order.append("usage")
+        return _codex_usage()
 
-    monkeypatch.setattr(autoreset, "AutoResetAuditLog", lambda **_kwargs: FailingAudit())
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", forbidden_usage)
+    monkeypatch.setattr(
+        autoreset, "AutoResetAuditLog", lambda **_kwargs: FailingAudit()
+    )
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", usage_transport)
     monkeypatch.setattr(
         footer_hook,
         "maybe_autoreset",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("coordinator ran after failed pre-usage drain")
+        lambda **_kwargs: autoreset.AutoResetResult(
+            "error", message="auto-reset audit is pending"
         ),
     )
 
     result = footer_hook.append_usage_footer("reply", model="gpt-5-codex")
 
-    assert result is None
-    assert order == ["append"]
+    # A failed drain retries on a later hook; it never suppresses the footer.
+    assert result is not None
+    assert result.startswith("reply\n\n───\n")
+    assert order == ["append", "usage"]
     assert store.load()["audit_outbox"] == event
 
 
@@ -526,7 +531,9 @@ def test_footer_passes_existing_usage_to_coordinator(monkeypatch):
     existing_usage = _codex_usage(remaining=50, credits=3)
     captured = {}
 
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: existing_usage)
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: existing_usage
+    )
 
     def fake_autoreset(**kwargs):
         captured.update(kwargs)
@@ -534,9 +541,7 @@ def test_footer_passes_existing_usage_to_coordinator(monkeypatch):
 
     monkeypatch.setattr(footer_hook, "maybe_autoreset", fake_autoreset)
 
-    footer_hook.append_usage_footer(
-        "reply", model="gpt-5-codex", session_id="sess-3"
-    )
+    footer_hook.append_usage_footer("reply", model="gpt-5-codex", session_id="sess-3")
 
     assert captured["usage"] is existing_usage
     assert captured["model"] == "gpt-5-codex"
@@ -545,7 +550,9 @@ def test_footer_passes_existing_usage_to_coordinator(monkeypatch):
 
 def test_footer_passes_transform_trigger(monkeypatch):
     captured = {}
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
 
     def fake_autoreset(**kwargs):
         captured.update(kwargs)
@@ -580,7 +587,9 @@ def test_footer_uses_refreshed_usage_after_reset(monkeypatch):
 
     assert result is not None
     assert "Codex weekly | used 0%, left 100% | plan plus | reset credits 2" in result
-    assert "Codex weekly | used 100%, left 0% | plan plus | reset credits 3" not in result
+    assert (
+        "Codex weekly | used 100%, left 0% | plan plus | reset credits 3" not in result
+    )
 
 
 def test_footer_pops_preflight_notice_once(monkeypatch):
@@ -591,7 +600,9 @@ def test_footer_pops_preflight_notice_once(monkeypatch):
             assert session_id == "sess-5"
             return notices.pop(0) if notices else None
 
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
     monkeypatch.setattr(
         footer_hook,
         "maybe_autoreset",
@@ -623,7 +634,9 @@ def test_footer_drains_locked_fallback_notice_once(monkeypatch):
             assert session_id == "sess-fallback"
             return fallback.pop(0) if fallback else None
 
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
     monkeypatch.setattr(
         footer_hook,
         "maybe_autoreset",
@@ -674,7 +687,9 @@ def test_footer_triggered_reset_adds_exactly_one_notice(monkeypatch):
     ["invalid_config", "transient", "pending", "auth_or_validation_error"],
 )
 def test_footer_never_renders_non_success_autoreset_messages(monkeypatch, status):
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
     monkeypatch.setattr(
         footer_hook,
         "maybe_autoreset",
@@ -693,10 +708,14 @@ def test_footer_never_renders_non_success_autoreset_messages(monkeypatch, status
     assert "Codex auto reset |" not in result
 
 
-def test_persisted_notice_pop_failure_never_uses_duplicate_message_fallback(monkeypatch):
+def test_persisted_notice_pop_failure_never_uses_duplicate_message_fallback(
+    monkeypatch,
+):
     notice = "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"
     pops = [None, notice]
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
     monkeypatch.setattr(footer_hook, "_pop_notice", lambda _session_id: pops.pop(0))
     monkeypatch.setattr(
         footer_hook,
@@ -722,7 +741,9 @@ def test_persisted_notice_pop_failure_never_uses_duplicate_message_fallback(monk
 
 
 def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
 
     def exploding_autoreset(**_kwargs):
         raise RuntimeError("coordinator failed")
@@ -732,13 +753,14 @@ def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
     result = footer_hook.append_usage_footer("reply", model="gpt-5-codex")
 
     assert result == (
-        "reply\n\n───\n"
-        "Codex weekly | used 90%, left 10% | plan plus | reset credits 3"
+        "reply\n\n───\nCodex weekly | used 90%, left 10% | plan plus | reset credits 3"
     )
 
 
 def test_audit_failure_still_returns_original_prompt_and_response(monkeypatch, caplog):
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
 
     def exploding_audit(**_kwargs):
         raise RuntimeError("audit append failed")
@@ -746,7 +768,9 @@ def test_audit_failure_still_returns_original_prompt_and_response(monkeypatch, c
     monkeypatch.setattr(footer_hook, "maybe_autoreset", exploding_audit)
 
     prompt_result = footer_hook.codex_autoreset_preflight(model="gpt-5-codex")
-    response_result = footer_hook.append_usage_footer("original reply", model="gpt-5-codex")
+    response_result = footer_hook.append_usage_footer(
+        "original reply", model="gpt-5-codex"
+    )
 
     assert prompt_result is None
     assert response_result == (
@@ -754,16 +778,16 @@ def test_audit_failure_still_returns_original_prompt_and_response(monkeypatch, c
         "Codex weekly | used 90%, left 10% | plan plus | reset credits 3"
     )
     assert [record.getMessage() for record in caplog.records] == [
-        "auto-reset audit evaluation failed",
-        "auto-reset audit evaluation failed",
+        "auto-reset audit evaluation failed (RuntimeError)",
+        "auto-reset audit evaluation failed (RuntimeError)",
     ]
 
 
-def test_no_raw_identifier_is_printed_to_stderr_on_audit_failure(
-    monkeypatch, capsys
-):
+def test_no_raw_identifier_is_printed_to_stderr_on_audit_failure(monkeypatch, capsys):
     raw_identifier = "redeem-request-raw-secret"
-    monkeypatch.setattr(footer_hook, "get_usage_for_model", lambda _model: _codex_usage())
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _codex_usage()
+    )
 
     def exploding_audit(**_kwargs):
         raise RuntimeError(f"audit append failed for {raw_identifier}")
@@ -1246,9 +1270,7 @@ def _mock_codex_transport(monkeypatch, handler, *, account_id="account-123"):
     monkeypatch.setattr(
         codex_usage.httpx,
         "Client",
-        lambda **kwargs: real_client(
-            transport=httpx.MockTransport(handler), **kwargs
-        ),
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
     )
 
 
@@ -1329,9 +1351,7 @@ def test_reset_transport_sends_chatgpt_account_header_when_present(
 
 @pytest.mark.parametrize("status_code", [401, 429, 500, 503])
 @pytest.mark.parametrize("operation", ["list", "consume"])
-def test_reset_transport_raises_on_401_429_and_5xx(
-    monkeypatch, status_code, operation
-):
+def test_reset_transport_raises_on_401_429_and_5xx(monkeypatch, status_code, operation):
     def handler(request):
         return httpx.Response(status_code, json={"error": "rejected"})
 

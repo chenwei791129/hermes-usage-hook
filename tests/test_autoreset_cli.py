@@ -62,7 +62,9 @@ def _run(argv: list[str]) -> int:
     return args.func(args)
 
 
-def test_history_defaults_to_last_twenty_oldest_to_newest(monkeypatch, tmp_path, capsys):
+def test_history_defaults_to_last_twenty_oldest_to_newest(
+    monkeypatch, tmp_path, capsys
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     events = [_event(index) for index in range(25)]
     _write_events(tmp_path, events)
@@ -101,20 +103,39 @@ def test_since_rejects_non_positive_or_unsupported_durations(value):
 
 def test_since_rejects_duration_too_large_for_timedelta(capsys):
     with pytest.raises(SystemExit) as raised:
-        _parser().parse_args(
-            ["history", "--since", "999999999999999999999999999d"]
-        )
+        _parser().parse_args(["history", "--since", "999999999999999999999999999d"])
 
     assert raised.value.code == 2
     assert "Traceback" not in capsys.readouterr().err
 
 
+def test_since_wider_than_datetime_range_keeps_all_events(
+    monkeypatch, tmp_path, capsys
+):
+    # Parser-valid but wider than datetime.min: must not raise OverflowError.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    event = _event(
+        1, observed_at=datetime(2026, 7, 15, tzinfo=timezone.utc).timestamp()
+    )
+    _write_events(tmp_path, [event])
+
+    assert _run(["history", "--since", "4000000d", "--json"]) == 0
+
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output == [event]
+
+
 def test_since_filters_before_last_limit(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
-    events = [_event(index, observed_at=now - age) for index, age in enumerate((14_400, 7_200, 3_600, 60))]
+    events = [
+        _event(index, observed_at=now - age)
+        for index, age in enumerate((14_400, 7_200, 3_600, 60))
+    ]
     _write_events(tmp_path, events)
-    monkeypatch.setattr(autoreset_cli, "_now_utc", lambda: datetime.fromtimestamp(now, timezone.utc))
+    monkeypatch.setattr(
+        autoreset_cli, "_now_utc", lambda: datetime.fromtimestamp(now, timezone.utc)
+    )
 
     assert _run(["history", "--since", "3h", "--last", "2", "--json"]) == 0
 
@@ -122,7 +143,9 @@ def test_since_filters_before_last_limit(monkeypatch, tmp_path, capsys):
     assert output == events[-2:]
 
 
-def test_human_output_uses_local_timezone_and_question_marks(monkeypatch, tmp_path, capsys):
+def test_human_output_uses_local_timezone_and_question_marks(
+    monkeypatch, tmp_path, capsys
+):
     if not hasattr(time, "tzset"):
         pytest.skip("host timezone switching is unavailable")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -192,9 +215,11 @@ def test_missing_file_json_is_silent_and_exit_zero(monkeypatch, tmp_path, capsys
     assert captured.err == ""
 
 
-def test_malformed_lines_warn_only_on_stderr_without_raw_content(monkeypatch, tmp_path, capsys):
+def test_malformed_lines_warn_only_on_stderr_without_raw_content(
+    monkeypatch, tmp_path, capsys
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    secret = b'not-json-with-secret-request-id\n'
+    secret = b"not-json-with-secret-request-id\n"
     event = _event(1)
     _write_events(tmp_path, [event], malformed=secret)
 
@@ -252,7 +277,7 @@ def test_busy_coordinator_lock_returns_one_without_reading_history(
 
 
 def test_clean_cli_import_never_imports_codex_transport_stack():
-    script = r'''
+    script = r"""
 import builtins
 import sys
 
@@ -280,7 +305,7 @@ loaded = sorted(
     if any(name == item or name.startswith(f"{item}.") for item in forbidden)
 )
 assert loaded == [], loaded
-'''
+"""
 
     completed = subprocess.run(
         [sys.executable, "-c", script],
@@ -344,24 +369,23 @@ def test_all_state_surfaces_use_authoritative_named_profile_without_env(
     assert audit_store.home == selected
     with autoreset_lock.acquire_autoreset_lock(now=1_000.0) as acquired:
         assert acquired
-        assert (
-            selected / "state" / "hermes-usage-hook" / "autoreset.lock"
-        ).is_dir()
+        assert (selected / "state" / "hermes-usage-hook" / "autoreset.lock").is_dir()
 
     event = _event(31)
     _write_events(selected, [event])
     assert _run(["history", "--json"]) == 0
-    assert capsys.readouterr().out == json.dumps(
-        event, separators=(",", ":"), ensure_ascii=False
-    ) + "\n"
+    assert (
+        capsys.readouterr().out
+        == json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+    )
 
 
 def test_real_plugin_root_registration_and_cli_handler_make_no_transport_calls(
-    tmp_path
+    tmp_path,
 ):
     event = _event(41)
     _write_events(tmp_path, [event])
-    script = r'''
+    script = r"""
 import argparse
 import httpx
 
@@ -409,7 +433,7 @@ ctx.cli["setup_fn"](parser)
 args = parser.parse_args(["history", "--json"])
 assert ctx.cli["handler_fn"](args) == 0
 assert calls == [], calls
-'''
+"""
     env = os.environ.copy()
     env["HERMES_HOME"] = str(tmp_path)
 
@@ -423,7 +447,8 @@ assert calls == [], calls
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout == json.dumps(
-        event, separators=(",", ":"), ensure_ascii=False
-    ) + "\n"
+    assert (
+        completed.stdout
+        == json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+    )
     assert completed.stderr == ""

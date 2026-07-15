@@ -625,6 +625,11 @@ def drain_autoreset_outbox(
         now = clock()
         if not _is_valid_timestamp(now):
             return False
+        # One unlocked read skips lock churn on every reply when there is
+        # nothing to recover — the common case, including installs that
+        # never enabled auto reset.
+        if state_store.load().get("audit_outbox") is None:
+            return True
         make_lock = lock_factory or (
             lambda: acquire_autoreset_lock(home=state_store.home, now=now)
         )
@@ -920,12 +925,12 @@ def maybe_autoreset(
         if not _is_valid_timestamp(now):
             return AutoResetResult("error", message="auto-reset clock is invalid")
 
-        state_path = getattr(state_store, "path", None)
-        try:
-            state_exists = state_path is None or Path(state_path).exists()
-        except OSError:
-            state_exists = True
-        if eligibility_result is not None and not state_exists:
+        # One unlocked read: an audit event stuck in the outbox must still
+        # reach the locked drain path even when eligibility, cooldown, or
+        # pending short-circuits would otherwise return before locking.
+        prelock_state = state_store.load()
+        outbox_pending = prelock_state.get("audit_outbox") is not None
+        if eligibility_result is not None and not outbox_pending:
             return eligibility_result
 
         before_remaining = None
@@ -935,12 +940,8 @@ def maybe_autoreset(
                 return AutoResetResult("ineligible")
             before_remaining = weekly_remaining(initial_usage)
             before_credits = _usage_credit_count(initial_usage)
-            prelock_state = state_store.load()
             prelock_pending = _pending_record(prelock_state)
-            force_lock_for_outbox = (
-                state_exists or prelock_state.get("audit_outbox") is not None
-            )
-            if not force_lock_for_outbox and state_store.cooldown_active(
+            if not outbox_pending and state_store.cooldown_active(
                 prelock_state, now=now
             ):
                 return AutoResetResult(
@@ -948,7 +949,7 @@ def maybe_autoreset(
                     before_remaining=before_remaining,
                     before_credits=before_credits,
                 )
-            if not force_lock_for_outbox and prelock_pending is not None:
+            if not outbox_pending and prelock_pending is not None:
                 retry_after = prelock_pending.get("retry_after")
                 if isinstance(retry_after, (int, float)) and now < retry_after:
                     return AutoResetResult(
@@ -956,7 +957,7 @@ def maybe_autoreset(
                         before_remaining=before_remaining,
                         before_credits=before_credits,
                     )
-            elif not force_lock_for_outbox and not is_eligible(
+            elif not outbox_pending and not is_eligible(
                 model=model, usage=initial_usage, config=effective
             ):
                 return AutoResetResult(

@@ -97,8 +97,14 @@ def usage_hook_command(args: argparse.Namespace) -> int:
 
     since = getattr(args, "since", None)
     if since is not None:
-        threshold = _now_utc() - timedelta(seconds=since)
-        events = [event for event in events if _parse_utc(event["observed_at"]) >= threshold]
+        try:
+            threshold = _now_utc() - timedelta(seconds=since)
+        except OverflowError:
+            # A window wider than representable time keeps every event.
+            threshold = datetime.min.replace(tzinfo=timezone.utc)
+        events = [
+            event for event in events if _parse_utc(event["observed_at"]) >= threshold
+        ]
     events = events[-args.last :]
 
     if malformed:
