@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
+import re
 from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 
+import install
 from plugin import autoreset, autoreset_cli
 from plugin import usage
 from plugin.hooks import footer_hook
@@ -725,6 +728,118 @@ def test_readme_documents_codex_autoreset_configuration():
     ]
     for needle in required:
         assert needle in readme
+
+
+def test_documentation_readme_covers_autoreset_audit_history():
+    readme = Path("README.md").read_text()
+    required = [
+        "$HERMES_HOME/logs/hermes-usage-hook-autoreset.jsonl",
+        "hermes usage-hook history --last 20",
+        "hermes usage-hook history --since 30d",
+        "hermes usage-hook history --json",
+        "Only successful logical resets are recorded",
+        "already_redeemed",
+        "observation/confirmation time",
+        "SHA-256",
+        "correlatable identifiers are omitted",
+        "no automatic rotation or deletion",
+        "offline and scoped to the active Hermes profile",
+        "Malformed lines are skipped with a count",
+        "v0.4.0 and earlier history cannot be authoritatively reconstructed",
+        "audit_outbox",
+        "prevents a new reset",
+    ]
+    for needle in required:
+        assert needle in readme
+
+    example_match = re.search(
+        r"Representative schema-v1 event:\s*```json\s*(\{.*?\})\s*```",
+        readme,
+        flags=re.DOTALL,
+    )
+    assert example_match is not None
+    event = json.loads(example_match.group(1))
+    assert set(event) == {
+        "schema_version",
+        "event_type",
+        "event_id",
+        "observed_at",
+        "backend_status",
+        "trigger",
+        "before",
+        "after",
+    }
+    assert event["schema_version"] == 1 and not isinstance(
+        event["schema_version"], bool
+    )
+    assert event["event_type"] == "codex_autoreset_succeeded"
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", event["event_id"])
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",
+        event["observed_at"],
+    )
+    assert event["backend_status"] in {"reset", "already_redeemed"}
+    assert event["trigger"] in {
+        "pre_llm_call",
+        "transform_llm_output",
+        "unknown",
+    }
+    for snapshot_name in ("before", "after"):
+        snapshot = event[snapshot_name]
+        assert set(snapshot) == {"weekly_remaining_percent", "reset_credits"}
+        percentage = snapshot["weekly_remaining_percent"]
+        assert percentage is None or (
+            isinstance(percentage, (int, float))
+            and not isinstance(percentage, bool)
+            and math.isfinite(percentage)
+            and 0 <= percentage <= 100
+        )
+        credits = snapshot["reset_credits"]
+        assert credits is None or (
+            isinstance(credits, int) and not isinstance(credits, bool) and credits >= 0
+        )
+
+    exact_contract_rules = [
+        "`schema_version` is the literal integer `1`",
+        "`event_type` is exactly `codex_autoreset_succeeded`",
+        "`event_id` is `sha256:` followed by exactly 64 lowercase hexadecimal characters",
+        "`backend_status` is `reset` or `already_redeemed`",
+        "`trigger` is `pre_llm_call`, `transform_llm_output`, or `unknown`",
+        "`observed_at` is an RFC 3339 UTC timestamp ending in `Z`",
+        "finite JSON number from `0` through `100`, inclusive, or `null`",
+        "non-negative JSON integer (never a boolean) or `null`",
+    ]
+    normalized_readme = " ".join(readme.split())
+    for rule in exact_contract_rules:
+        assert rule in normalized_readme
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    [
+        r"\bautomatic history rotation\b",
+        r"\b(?:automatically|periodically)\s+(?:rotate|rotates|delete|deletes|prune|prunes|truncate|truncates)\b",
+        r"\bhistory\s+(?:is|will be)\s+(?:rotated|deleted|pruned|truncated)\b",
+        r"\bhistorical backfill is provided\b",
+        r"\b(?:historical\s+)?backfill\s+(?:is|will be)\s+(?:provided|available|performed)\b",
+        r"\b(?:plugin|installer)\s+(?:backfills|reconstructs)\s+(?:old|earlier|historical|prior)\b",
+    ],
+)
+def test_documentation_does_not_claim_rotation_or_backfill(contradiction):
+    readme = Path("README.md").read_text().lower()
+    assert re.search(contradiction, readme) is None
+
+
+def test_installer_packages_all_autoreset_audit_modules(tmp_path):
+    destination = install.install_plugin_dir(
+        install.PLUGIN_SRC, tmp_path / "hermes", install.PLUGIN_NAME
+    )
+
+    assert {
+        "autoreset_audit.py",
+        "autoreset_cli.py",
+        "autoreset_lock.py",
+    } <= {path.name for path in destination.glob("*.py")}
 
 
 # --- Codex auth.json location (prefer Hermes' store, fall back to Codex CLI) ----

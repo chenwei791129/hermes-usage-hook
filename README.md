@@ -129,6 +129,90 @@ After a successful reset, the footer includes an audit example like:
 Codex auto reset | weekly 0% → 100% | reset credits 3 → 2
 ```
 
+#### Auto-reset audit history
+
+The plugin keeps an append-only, profile-scoped success history at
+`$HERMES_HOME/logs/hermes-usage-hook-autoreset.jsonl`.
+Only successful logical resets are recorded: a terminal backend status of either
+`reset` or
+`already_redeemed` produces one event for the same logical redeem request.
+Failures, cooldowns, ineligible checks, and attempts that never reach a
+successful terminal status are not history events.
+
+Each line is one schema-v1 JSON object with exactly these top-level fields:
+`schema_version`, `event_type`, `event_id`, `observed_at`, `backend_status`,
+`trigger`, `before`, and `after`. The `before` and `after` snapshots contain only
+`weekly_remaining_percent` and `reset_credits`.
+
+Representative schema-v1 event:
+
+```json
+{
+  "schema_version": 1,
+  "event_type": "codex_autoreset_succeeded",
+  "event_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "observed_at": "2026-07-15T12:34:56Z",
+  "backend_status": "reset",
+  "trigger": "pre_llm_call",
+  "before": {"weekly_remaining_percent": 0, "reset_credits": 3},
+  "after": {"weekly_remaining_percent": 100, "reset_credits": 2}
+}
+```
+
+The exact contract is:
+
+- `schema_version` is the literal integer `1`; `event_type` is exactly
+  `codex_autoreset_succeeded`.
+- `event_id` is `sha256:` followed by exactly 64 lowercase hexadecimal characters.
+- `backend_status` is `reset` or `already_redeemed`; `trigger` is `pre_llm_call`,
+  `transform_llm_output`, or `unknown`.
+- `observed_at` is an RFC 3339 UTC timestamp ending in `Z`.
+- Each `weekly_remaining_percent` is a finite JSON number from `0` through `100`,
+  inclusive, or `null`. Each `reset_credits` is a non-negative JSON integer
+  (never a boolean) or `null`.
+
+For `already_redeemed`, `observed_at` is the observation/confirmation time when
+this plugin learned that the logical request had already succeeded; it is not an
+invented time for the backend's original reset.
+
+Event IDs are `sha256:`-prefixed SHA-256 hashes of the redeem request ID, used
+for stable deduplication without retaining the raw ID.
+All other correlatable identifiers are omitted, including raw redeem-request and credit IDs, account,
+user, session, turn, and model IDs, prompts, responses, credentials, and backend
+bodies.
+
+History retention is permanent: there is no automatic rotation or deletion,
+and the plugin never truncates, rewrites, prunes, or deletes this audit file.
+Operators must treat external retention or deletion as an explicit local policy.
+History begins only after this audit feature is deployed.
+v0.4.0 and earlier history cannot be authoritatively reconstructed, so no historical backfill is
+attempted from state, footer text, or rotated Gateway/session logs.
+
+Query the active profile's local file with:
+
+```bash
+hermes usage-hook history --last 20
+hermes usage-hook history --since 30d
+hermes usage-hook history --json
+```
+
+The command is offline and scoped to the active Hermes profile selected through
+`HERMES_HOME`; it does not load credentials, refresh usage, list credits, or
+consume a reset credit. `--since` filters in UTC before `--last`; human output
+uses local time, while `--json` emits compact JSONL with clean stdout. Valid
+records remain readable if the file also contains damaged data.
+Malformed lines are skipped with a count reported on stderr, without printing their contents.
+
+Crash recovery uses the existing state file's single durable `audit_outbox`.
+The successful terminal transition, one-shot notice, cooldown, and event are
+saved in the same coordinator-locked atomic write before append. On the next
+locked hook invocation, any outbox is appended (or deduplicated by `event_id`)
+before network work and is cleared only after append succeeds. An append or
+clear failure preserves the outbox and the successful reset result; an
+unresolved outbox prevents a new reset from overwriting the pending event or
+consuming another credit. A crash before append therefore retries the event,
+and a crash after append but before clear safely deduplicates it.
+
 Do not add auto-reset values or `requires_env` to `plugin/plugin.yaml`; the
 manifest only declares the supported hooks.
 
@@ -151,7 +235,10 @@ tier, so the `| plan …` segment is omitted.
 | `plugin/plugin.yaml` | Hermes plugin manifest: declares the plugin name, `kind: standalone`, and exactly two hooks: `transform_llm_output` and `pre_llm_call`. |
 | `plugin/__init__.py` | Plugin root entry point: puts the plugin directory on `sys.path` and re-exports `register(ctx)` from the footer hook. |
 | `plugin/usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the summary. |
-| `plugin/autoreset.py` | Codex auto-reset config, threshold policy, earliest-expiry credit selection, state, lock, cooldowns, idempotency, and one-shot notices. |
+| `plugin/autoreset.py` | Codex auto-reset config, threshold policy, earliest-expiry credit selection, state, cooldowns, idempotency, durable audit outbox, and one-shot notices. |
+| `plugin/autoreset_audit.py` | Privacy-minimized audit schema plus append-only, deduplicated JSONL persistence and malformed-line-safe reading. |
+| `plugin/autoreset_cli.py` | Offline, active-profile `hermes usage-hook history` argument parsing, filtering, locking, and rendering. |
+| `plugin/autoreset_lock.py` | Shared stdlib-only cross-process coordinator lock used by reset writers and history readers. |
 | `plugin/providers/codex_usage.py` | Read `auth.json` (read-only), fetch and normalize Codex usage, list reset credits, and POST one idempotent reset-credit consume attempt. |
 | `plugin/providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
 | `plugin/hooks/footer_hook.py` | The Hermes hook module that registers the footer and Codex preflight hooks, appends usage, and renders auto-reset audit notices. |
