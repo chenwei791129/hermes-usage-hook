@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
+import sys
+import types
 from pathlib import Path
 
 import httpx
@@ -1180,3 +1183,197 @@ def test_provider_errors_do_not_include_bearer_token(monkeypatch):
 
     assert "secret-access-token" not in str(exc_info.value)
     assert "Bearer" not in str(exc_info.value)
+
+
+# --- /usagehook in-session history command ------------------------------------
+
+
+def _hist_event(seed="a", **fields):
+    event = {
+        "event_id": "sha256:" + seed[0] * 64,
+        "observed_at": "2026-07-14T09:12:00Z",
+        "backend_status": "reset",
+        "weekly_before": 4,
+        "weekly_after": 100,
+        "credits_before": 3,
+        "credits_after": 2,
+    }
+    event.update(fields)
+    return event
+
+
+def _write_history(tmp_path, *events):
+    path = tmp_path / "logs" / "hermes-usage-hook-autoreset.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+
+def test_usagehook_history_renders_example_line(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, _hist_event("a"))
+
+    assert footer_hook.usagehook_command("history") == (
+        "Codex auto-reset history (last 1)\n"
+        "2026-07-14 09:12 UTC | reset | weekly 4% → 100% | credits 3 → 2"
+    )
+
+
+def test_usagehook_history_defaults_to_last_five_in_append_order(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, *[_hist_event(seed) for seed in "abcdef1"])
+
+    lines = footer_hook.usagehook_command("history").splitlines()
+
+    assert lines[0] == "Codex auto-reset history (last 5)"
+    assert len(lines) == 6  # header plus the newest five events
+
+
+def test_usagehook_history_explicit_count_within_bounds(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, *[_hist_event(seed) for seed in "abc"])
+
+    lines = footer_hook.usagehook_command("history 2").splitlines()
+
+    assert lines[0] == "Codex auto-reset history (last 2)"
+    assert len(lines) == 3
+
+
+def test_usagehook_renders_null_snapshot_as_question_mark(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, _hist_event("a", weekly_after=None, credits_before=None))
+
+    out = footer_hook.usagehook_command("history")
+
+    assert "weekly 4% → ?%" in out
+    assert "credits ? → 2" in out
+
+
+@pytest.mark.parametrize("arg", ["history 0", "history 101", "history 5.5"])
+def test_usagehook_out_of_range_or_non_integer_count_shows_usage(
+    monkeypatch, tmp_path, arg
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, _hist_event("a"))
+
+    assert footer_hook.usagehook_command(arg) == "Usage: /usagehook history [N]"
+
+
+def test_usagehook_no_history_yet(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    assert footer_hook.usagehook_command("history") == (
+        "No Codex auto-reset history yet."
+    )
+
+
+@pytest.mark.parametrize(
+    "arg", ["", "   ", "hist", "History", "usage", "history one two"]
+)
+def test_usagehook_invalid_input_shows_usage(monkeypatch, tmp_path, arg):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, _hist_event("a"))
+
+    assert footer_hook.usagehook_command(arg) == "Usage: /usagehook history [N]"
+
+
+def test_usagehook_handler_failure_degrades_gracefully(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("read blew up")
+
+    monkeypatch.setattr(footer_hook.autoreset_audit, "read_events", boom)
+
+    assert footer_hook.usagehook_command("history") == (
+        "Codex auto-reset history is unavailable."
+    )
+
+
+# --- /usagehook command registration ------------------------------------------
+
+
+class _CommandContext(_HookContext):
+    def __init__(self):
+        super().__init__()
+        self.commands = []
+
+    def register_command(self, name, handler):
+        self.commands.append((name, handler))
+
+
+def test_register_adds_usagehook_command_when_supported():
+    ctx = _CommandContext()
+
+    footer_hook.register(ctx)
+
+    assert ctx.commands == [("usagehook", footer_hook.usagehook_command)]
+    assert ctx.calls == [
+        ("transform_llm_output", footer_hook.append_usage_footer),
+        ("pre_llm_call", footer_hook.codex_autoreset_preflight),
+    ]
+
+
+def test_register_without_register_command_still_registers_both_hooks(caplog):
+    ctx = _HookContext()
+
+    with caplog.at_level(logging.WARNING):
+        footer_hook.register(ctx)
+
+    assert ctx.calls == [
+        ("transform_llm_output", footer_hook.append_usage_footer),
+        ("pre_llm_call", footer_hook.codex_autoreset_preflight),
+    ]
+    assert "register_command" in caplog.text
+
+
+def test_usagehook_reads_the_coordinator_store_home_not_the_profile_default(
+    monkeypatch, tmp_path
+):
+    # Regression: the success path writes the history file under the coordinator
+    # state store's home, so the query must resolve the same home. If it fell
+    # back to an un-injected profile-safe lookup, an active profile / platform
+    # default could point elsewhere and report an empty history despite resets.
+    store_home = tmp_path / "store-home"
+    other_home = tmp_path / "profile-home"
+    monkeypatch.setenv("HERMES_HOME", str(store_home))  # AutoResetStateStore().home
+    fake = types.ModuleType("hermes_constants")
+    fake.get_hermes_home = lambda: other_home  # a divergent profile-safe location
+    monkeypatch.setitem(sys.modules, "hermes_constants", fake)
+    _write_history(store_home, _hist_event("a"))
+
+    out = footer_hook.usagehook_command("history")
+
+    assert out.startswith("Codex auto-reset history (last 1)")
+
+
+@pytest.mark.parametrize("arg", ["history ５", "history ٥", "history 1٥"])
+def test_usagehook_rejects_non_ascii_digit_counts(monkeypatch, tmp_path, arg):
+    # isdecimal() accepts full-width / Arabic-Indic digits; the count must be a
+    # plain ASCII decimal integer, so these fall back to the usage message.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, _hist_event("a"))
+
+    assert footer_hook.usagehook_command(arg) == "Usage: /usagehook history [N]"
+
+
+def test_usagehook_renders_unknown_backend_status_as_question_mark(
+    monkeypatch, tmp_path
+):
+    # backend_status is not validated on read, so a hand-edited/partial line with
+    # a missing or arbitrary status must render defensively rather than verbatim.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, _hist_event("a", backend_status="TAMPERED"))
+
+    out = footer_hook.usagehook_command("history")
+
+    assert "TAMPERED" not in out
+    assert "| ? |" in out
+
+
+def test_usagehook_handler_tolerates_extra_keyword_arguments(monkeypatch, tmp_path):
+    # The host command dispatch may pass extra keyword args; absorbing them keeps
+    # the handler from raising a TypeError outside its guarded body.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_history(tmp_path, _hist_event("a"))
+
+    out = footer_hook.usagehook_command("history", command="usagehook", ctx=object())
+
+    assert out.startswith("Codex auto-reset history (last 1)")

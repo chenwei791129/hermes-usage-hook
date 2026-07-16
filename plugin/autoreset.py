@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import time
@@ -17,11 +18,14 @@ from uuid import uuid4
 
 import httpx
 
+from . import autoreset_audit
 from .providers.codex_usage import (
     consume_rate_limit_reset_credit,
     list_rate_limit_reset_credits,
 )
 from .usage import get_usage_for_model, matches_codex_model
+
+logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "hermes-usage-hook"
 ENV_ENABLED = "CODEX_ENABLE_AUTORESET"
@@ -797,9 +801,11 @@ def maybe_autoreset(
     uuid_factory: Callable[[], object] | None = None,
     lock_factory: Callable[[], AbstractContextManager[bool]] | None = None,
     clock: Callable[[], float] = time.time,
+    audit_log: Any = None,
 ) -> AutoResetResult:
     """Attempt one synchronous, fail-closed, idempotent Codex auto reset."""
     del turn_id  # Reserved for future non-sensitive audit correlation.
+    audit = audit_log if audit_log is not None else autoreset_audit
     try:
         effective = config if config is not None else load_autoreset_config()
         if not effective.valid:
@@ -1037,6 +1043,22 @@ def maybe_autoreset(
                 notice_persisted = state_store.queue_fallback_notice_locked(
                     state, session_id, message, now=now
                 )
+                # Best-effort local history: any failure here must not change the
+                # reset outcome or notice, and the exception detail (which may
+                # carry backend data) must never reach the log.
+                try:
+                    event = audit.build_success_event(
+                        redeem_request_id=request_id,
+                        observed_at=now,
+                        backend_status=code,
+                        weekly_before=before_remaining,
+                        weekly_after=after_remaining,
+                        credits_before=before_credits,
+                        credits_after=after_credits,
+                    )
+                    audit.append_success_event(event, home=state_store.home)
+                except Exception:  # noqa: BLE001 - history append is best-effort
+                    logger.warning("auto-reset history append failed")
                 return AutoResetResult(
                     code,
                     before_remaining=before_remaining,
