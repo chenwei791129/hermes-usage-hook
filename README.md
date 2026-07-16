@@ -132,6 +132,36 @@ Codex auto reset | weekly 0% → 100% | reset credits 3 → 2
 Do not add auto-reset values or `requires_env` to `plugin/plugin.yaml`; the
 manifest only declares the supported hooks.
 
+### Reset history
+
+Each successful Codex auto reset also appends one line to a permanent, local
+history file:
+
+```text
+$HERMES_HOME/logs/hermes-usage-hook-autoreset.jsonl
+```
+
+The append is best-effort: if it fails, the reset outcome, footer, and one-shot
+notice are unchanged and only a static warning is logged. The file is never
+rotated, truncated, or pruned — it is kept permanently (about 200 bytes per
+event, roughly one event per week). Each record is privacy-minimized: it stores
+only a hashed event ID (`sha256:<hex>` of the redeem request ID — never the raw
+ID), an RFC 3339 UTC timestamp, the backend status, and the before/after weekly
+and credit usage snapshots. No raw request, credit, session, or account
+identifiers are ever written.
+
+Query the history from any chat platform with the in-session command
+`/usagehook history [N]` (N is 1–100; defaults to the newest 5 events):
+
+```text
+/usagehook history
+Codex auto-reset history (last 1)
+2026-07-14 09:12 UTC | reset | weekly 4% → 100% | credits 3 → 2
+```
+
+Unavailable snapshot values render as `?`. When no history exists yet the
+command replies `No Codex auto-reset history yet.`
+
 ### MiniMax usage
 
 The MiniMax fetcher needs an API token (pure API key — no OAuth), resolved in
@@ -152,9 +182,11 @@ tier, so the `| plan …` segment is omitted.
 | `plugin/__init__.py` | Plugin root entry point: puts the plugin directory on `sys.path` and re-exports `register(ctx)` from the footer hook. |
 | `plugin/usage.py` | Provider detection + dispatch: maps a reply's `model` to a provider, fetches its normalized usage, and renders the summary. |
 | `plugin/autoreset.py` | Codex auto-reset config, threshold policy, earliest-expiry credit selection, state, lock, cooldowns, idempotency, and one-shot notices. |
+| `plugin/autoreset_audit.py` | Best-effort permanent reset history: build privacy-minimized flat events, append (deduplicated by hashed event ID), and read them back leniently. |
+| `plugin/hermes_home.py` | Profile-safe Hermes home resolution via `hermes_constants.get_hermes_home()`, falling back to `HERMES_HOME` when that module is absent. |
 | `plugin/providers/codex_usage.py` | Read `auth.json` (read-only), fetch and normalize Codex usage, list reset credits, and POST one idempotent reset-credit consume attempt. |
 | `plugin/providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
-| `plugin/hooks/footer_hook.py` | The Hermes hook module that registers the footer and Codex preflight hooks, appends usage, and renders auto-reset audit notices. |
+| `plugin/hooks/footer_hook.py` | The Hermes hook module that registers the footer and Codex preflight hooks, the `/usagehook` history command, appends usage, and renders auto-reset audit notices. |
 
 ## Local development
 

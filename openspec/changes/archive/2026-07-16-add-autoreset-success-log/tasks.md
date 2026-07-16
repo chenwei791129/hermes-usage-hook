@@ -1,0 +1,22 @@
+## 1. Home 解析與歷史模組
+
+- [x] 1.1 實作 spec 需求 "History resolves the Hermes home through the official profile-safe API"：建立 `plugin/hermes_home.py` 提供 `resolve_hermes_home(home=None) -> Path`：注入值優先；否則呼叫 `hermes_constants.get_hermes_home()`；僅當 `ModuleNotFoundError` 的 `name` 為 `hermes_constants` 時退回 `Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()`，其他匯入錯誤照常拋出。驗證：`tests/test_autoreset_audit.py` 覆蓋「模組可匯入時採 `get_hermes_home()` 回傳值」與「模組缺席時採 `HERMES_HOME`」兩個情境並通過。
+- [x] 1.2 實作 spec 需求 "Events are privacy-minimized flat records deduplicated by hashed redeem request ID"（事件建構部分）：建立 `plugin/autoreset_audit.py` 的 `build_success_event(...)`：回傳扁平事件 dict（`event_id`=`sha256:<64 hex>`、`observed_at`=RFC3339 UTC `Z` 結尾、`backend_status` 限 `reset`/`already_redeemed`、四個快照欄位無效值一律 `null`）；`redeem_request_id` 空值、`backend_status` 非法、`observed_at` 非有限時間戳時 raise `ValueError`。驗證：單元測試覆蓋合法事件、三種 raise 條件，以及 design 快照係數表（4→4、101→null、true→null、NaN→null、字串→null）並通過。
+- [x] 1.3 [P] 在 `plugin/autoreset_audit.py` 實作 `append_success_event(event, *, home=None) -> bool`：目標檔 `<home>/logs/hermes-usage-hook-autoreset.jsonl`，父目錄自動建立，`os.open(..., O_APPEND|O_CREAT|O_WRONLY, 0o600)` 開檔並 best-effort `chmod 0600`（失敗忽略、不驗證）；`event_id` 已存在檔中時不寫入並回傳 `False`，否則追加一行 compact JSON 回傳 `True`。驗證：單元測試覆蓋首次追加、重複 `event_id` 跳過、目錄不存在自動建立、chmod 失敗仍成功追加，並通過。
+- [x] 1.4 [P] 在 `plugin/autoreset_audit.py` 實作 `read_events(*, home=None) -> list[dict]`：檔案不存在回空 list；依檔案順序回傳含合法 `event_id` 與 `observed_at` 的事件；無法解析或欄位非法的行靜默略過，且原始行內容不得出現在任何日誌或例外訊息。驗證：單元測試以「合法行 + 壞 JSON 行 + 缺欄位行」混合檔案斷言只回傳合法事件，並以 caplog 斷言壞行內容未被記錄，通過。
+
+## 2. 成功路徑寫入
+
+- [x] 2.1 實作 spec 需求 "Successful resets attempt one best-effort local history append"：在 `plugin/autoreset.py` 的 terminal success 分支（`queue_fallback_notice_locked(...)` 之後、同一 coordinator lock 範圍內，注意該分支目前是單一運算式 `return`，需先 append 再 return）以 try/except 包裹執行 build event → `append_success_event(event, home=state_store.home)`（home 必須貫穿注入，變數對應見 design：`request_id`、`before_remaining`/`after_remaining`、`before_credits`/`after_credits`、`now`）；失敗僅 `logger.warning("auto-reset history append failed")`（靜態訊息，不含例外內文），`AutoResetResult` 的所有欄位與 notice 行為完全不變；`maybe_autoreset` 新增測試注入參數 `audit_log`（預設走真實模組）。驗證：`tests/test_autoreset.py` 新增測試——成功 reset 恰寫一筆且事件檔位於注入 store 的 `tmp_path/logs/` 下、`already_redeemed` 同一 request ID 不重複、success cooldown 生效期間的第二次呼叫不新增事件、append raise 時回傳值與 notice 與現狀完全一致且 caplog 只含靜態警告，全部通過。
+- [x] 2.2 確認既有 auto reset 測試在未注入 `audit_log` 時不因寫入真實家目錄而互相汙染：所有觸及 success 分支的既有測試以 `home=tmp_path` 的 store 執行（現況已如此），新寫入落在 `tmp_path/logs/` 下。驗證：`uv run python -m pytest tests/test_autoreset.py -q` 全數通過，且測試後開發者家目錄無新檔案（以既有 tmp_path 慣例保證）。
+
+## 3. /usagehook 查詢指令
+
+- [x] 3.1 實作 spec 需求 "Users query history with the /usagehook in-session command"（handler 部分）：在 `plugin/hooks/footer_hook.py` 新增 `/usagehook` handler：參數空白 tokenize 後恰為 `history`（區分大小寫）或 `history <N>`（N 為 1-100 十進位整數）→ 回傳標題行 `Codex auto-reset history (last <k>)`（k 為實際渲染筆數）加上最新 N 筆（預設 5）、每筆一行、依檔案 append 順序舊在上新在下，格式 `2026-07-14 09:12 UTC | reset | weekly 4% → 100% | credits 3 → 2`（時間戳解析 `observed_at` 後以 UTC 分鐘精度格式化），`null` 快照顯示 `?`；無紀錄回傳 `No Codex auto-reset history yet.`；空字串、無法識別的輸入、N 越界（0、101）或非整數（5.5）一律回傳 `Usage: /usagehook history [N]`；handler 內任何例外回傳 `Codex auto-reset history is unavailable.` 且不外洩例外。讀取不取得 coordinator lock、不以 `observed_at` 排序。驗證：`tests/test_usage.py` 覆蓋六種輸出（有紀錄、指定筆數、越界或非整數筆數 → usage、無紀錄、錯誤用法、例外降級）並通過。
+- [x] 3.2 在 `register(ctx)` 以 `getattr(ctx, "register_command", None)` 防護註冊 `usagehook` 指令：API 缺席時記 warning、跳過註冊，兩個既有 hook（`transform_llm_output`、`pre_llm_call`）照常註冊；同步更新 `plugin/hooks/footer_hook.py` 模組 docstring（「Registers exactly two synchronous hooks」需涵蓋新的 slash command）；`plugin/plugin.yaml` 不變（`register_command` 為 runtime API，不需 manifest 宣告，見 design）。驗證：`tests/test_usage.py` 新增「context 具備 register_command 時完成註冊」與「context 缺 register_command 時仍註冊兩個 hook」兩個測試，既有 `test_register_adds_transform_and_pre_llm_hooks_exactly_once` 與 manifest 測試維持通過。
+
+## 4. 文件與整體驗證
+
+- [x] 4.1 更新 `README.md`：新增「Reset history」小節說明歷史檔路徑 `$HERMES_HOME/logs/hermes-usage-hook-autoreset.jsonl`、永久保留與隱私欄位（僅雜湊 ID 與用量快照），以及 `/usagehook history [N]` 的使用方式與範例輸出。驗證：README 包含檔案路徑、指令用法與一行範例輸出；`uv run python -m pytest tests/ -q` 全數通過。
+- [x] 4.2 整體品質關卡：`uv run python -m pytest -q` 全數通過、`uv run ruff check plugin/ tests/` 與 `uv run ruff format --check` 對本次觸及檔案無新增違規、`uv run ty check plugin/` 通過。驗證：三個指令輸出乾淨；此為完成本 change 的必要條件。
+- [ ] 4.3 請使用者在真實 Hermes 環境驗證：觸發一次成功 auto reset 後於聊天輸入 `/usagehook history`，確認出現一筆新紀錄且 footer 行為不變。驗證：使用者回報查詢輸出符合 spec 範例格式。
