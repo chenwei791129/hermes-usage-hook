@@ -249,6 +249,14 @@ without a leading `v`):
 uv run https://raw.githubusercontent.com/chenwei791129/hermes-usage-hook/main/install.py --version 0.2.0
 ```
 
+**Install the latest `main`** (or any branch, tag, or commit) with `--ref`. This
+fetches that ref's source tarball directly, bypassing the Releases API, so you
+can install unreleased changes without cloning:
+
+```bash
+uv run https://raw.githubusercontent.com/chenwei791129/hermes-usage-hook/main/install.py --ref main
+```
+
 **Install from a local checkout** with `--local`. With no path it uses the
 `plugin/` directory next to the script (the classic clone-and-install flow); a
 remote invocation must pass an explicit existing path:
@@ -259,8 +267,8 @@ cd hermes-usage-hook
 uv run install.py --local
 ```
 
-`--local` and `--version` are mutually exclusive (a local directory has no
-release version).
+`--local`, `--version`, and `--ref` are mutually exclusive (each names a
+different install source).
 
 **Remove the plugin** with the `remove` subcommand. It deletes the installed
 directory and removes the `plugins.enabled` entry; both actions are idempotent:
@@ -278,6 +286,7 @@ otherwise it exits non-zero without deleting anything.
 | Flag                 | Effect                                                                             |
 | -------------------- | ---------------------------------------------------------------------------------- |
 | `--version TAG`      | install a specific release tag (install), or guard removal by version (remove)     |
+| `--ref BRANCH_OR_SHA`| install a branch/tag/commit source tarball, e.g. `--ref main` (install only)       |
 | `--local [PATH]`     | install from a local directory instead of a release (install only)                 |
 | `--repo OWNER/NAME`  | source repository for downloads, default `chenwei791129/hermes-usage-hook` (install only) |
 | `--hermes-home PATH` | override the Hermes home dir; takes precedence over `HERMES_HOME` (default `~/.hermes`) |
