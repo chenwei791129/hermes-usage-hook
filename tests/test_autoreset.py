@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 import logging
+import sys
 
 import httpx
 import pytest
@@ -310,6 +311,61 @@ def _pending_attempt():
         "before_remaining": 0,
         "before_credits": 3,
     }
+
+
+# --- Requirement: Plugin-owned files resolve the home via one resolver ---
+
+
+def test_hermes_home_delegates_to_profile_safe_resolver(
+    monkeypatch, tmp_path, fake_hermes_constants
+):
+    # With the official module present, _hermes_home() must resolve the
+    # profile-safe home, not the divergent HERMES_HOME env value the old env-only
+    # helper would have returned.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-home"))
+    profile_home = fake_hermes_constants(tmp_path / "profile-home")
+
+    assert autoreset._hermes_home() == profile_home
+
+
+def test_hermes_home_falls_back_to_env_when_module_absent(monkeypatch, tmp_path):
+    # With the official module absent, _hermes_home() keeps the HERMES_HOME
+    # fallback.
+    monkeypatch.delitem(sys.modules, "hermes_constants", raising=False)
+    env_home = tmp_path / "env-home"
+    monkeypatch.setenv("HERMES_HOME", str(env_home))
+
+    assert autoreset._hermes_home() == env_home
+
+
+def _coordinator_dir(home):
+    return home / "state" / autoreset.PLUGIN_ID
+
+
+@pytest.mark.parametrize("module_present", [True, False], ids=["present", "absent"])
+def test_state_and_locks_resolve_under_the_active_home(
+    monkeypatch, tmp_path, fake_hermes_constants, module_present
+):
+    # State store, coordinator lock, and notice lock all resolve their default
+    # home through the one resolver: get_hermes_home() when the official module
+    # is present, else $HERMES_HOME. Covers the spec's "Hermes runtime present"
+    # and "Standalone" scenarios for the coordinator files.
+    if module_present:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-home"))
+        expected_home = fake_hermes_constants(tmp_path / "profile-home")
+    else:
+        monkeypatch.delitem(sys.modules, "hermes_constants", raising=False)
+        expected_home = tmp_path / "env-home"
+        monkeypatch.setenv("HERMES_HOME", str(expected_home))
+    coordinator = _coordinator_dir(expected_home)
+
+    assert autoreset.AutoResetStateStore().home == expected_home
+    with autoreset.acquire_autoreset_lock(now=1_000.0) as acquired:
+        assert acquired
+        assert (coordinator / "autoreset.lock").exists()
+    with autoreset.acquire_notice_lock(now=1_000.0) as acquired:
+        assert acquired
+        assert (coordinator / "autoreset-notices.lock").exists()
 
 
 def test_state_uses_hermes_home_and_contains_no_credentials(monkeypatch, tmp_path):

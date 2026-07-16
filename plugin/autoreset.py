@@ -19,6 +19,7 @@ from uuid import uuid4
 import httpx
 
 from . import autoreset_audit
+from .hermes_home import resolve_hermes_home
 from .providers.codex_usage import (
     consume_rate_limit_reset_credit,
     list_rate_limit_reset_credits,
@@ -257,8 +258,12 @@ class CorruptStateError(RuntimeError):
 
 
 def _hermes_home() -> Path:
-    """Return the active profile's Hermes home without importing Hermes."""
-    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    """Resolve the plugin's Hermes home via the one profile-safe resolver.
+
+    A stable internal seam so state, locks, notices, and history share one home;
+    the resolution rules live in ``resolve_hermes_home()``.
+    """
+    return resolve_hermes_home()
 
 
 def _clean_state(state: dict) -> dict:

@@ -13,8 +13,6 @@ import inspect
 import json
 import logging
 import os
-import sys
-import types
 from pathlib import Path
 
 import httpx
@@ -22,6 +20,7 @@ import pytest
 import yaml
 
 from plugin import autoreset
+from plugin import autoreset_audit
 from plugin import usage
 from plugin.hooks import footer_hook
 from plugin.providers import codex_usage, minimax_usage
@@ -1239,20 +1238,29 @@ def test_register_without_register_command_still_registers_both_hooks(caplog):
     assert "register_command" in caplog.text
 
 
-def test_usagehook_reads_the_coordinator_store_home_not_the_profile_default(
-    monkeypatch, tmp_path
+def test_usagehook_reads_history_from_the_unified_profile_safe_home(
+    monkeypatch, tmp_path, fake_hermes_constants
 ):
-    # Regression: the success path writes the history file under the coordinator
-    # state store's home, so the query must resolve the same home. If it fell
-    # back to an un-injected profile-safe lookup, an active profile / platform
-    # default could point elsewhere and report an empty history despite resets.
-    store_home = tmp_path / "store-home"
-    other_home = tmp_path / "profile-home"
-    monkeypatch.setenv("HERMES_HOME", str(store_home))  # AutoResetStateStore().home
-    fake = types.ModuleType("hermes_constants")
-    fake.get_hermes_home = lambda: other_home  # a divergent profile-safe location
-    monkeypatch.setitem(sys.modules, "hermes_constants", fake)
-    _write_history(store_home, _hist_event("a"))
+    # Read and write now resolve through one profile-safe resolver: a reset the
+    # coordinator records under the profile home (get_hermes_home()) is read back
+    # by the query without injecting the store's home, even though HERMES_HOME
+    # points at a divergent location. Building the event via the coordinator
+    # write path (append_success_event under the store home), rather than the
+    # local _write_history helper, exercises that read/write agreement end to end.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-home"))
+    fake_hermes_constants(tmp_path / "profile-home")
+    event = autoreset_audit.build_success_event(
+        redeem_request_id="req-a",
+        observed_at=1_784_020_320.0,
+        backend_status="reset",
+        weekly_before=4,
+        weekly_after=100,
+        credits_before=3,
+        credits_after=2,
+    )
+    autoreset_audit.append_success_event(
+        event, home=autoreset.AutoResetStateStore().home
+    )
 
     out = footer_hook.usagehook_command("history")
 
