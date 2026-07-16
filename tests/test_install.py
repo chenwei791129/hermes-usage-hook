@@ -259,6 +259,48 @@ def test_install_version_pins_release(tmp_path, monkeypatch):
     assert installed["version"] == "0.2.0"
 
 
+def test_ref_tarball_url_targets_the_tarball_endpoint():
+    # Our helper points straight at GitHub's /tarball/{ref} endpoint (not the
+    # Releases API), passing the ref through verbatim.
+    assert (
+        install.ref_tarball_url("owner/repo", "main")
+        == "https://api.github.com/repos/owner/repo/tarball/main"
+    )
+
+
+def test_install_ref_fetches_branch_tarball_without_release_api(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    # Wire ONLY the ref's tarball endpoint — no releases/latest or releases/tags
+    # responses — so a passing install proves --ref bypasses the Releases API and
+    # pulls the branch source tarball directly.
+    responses = {_tarball_url("main"): _plugin_tarball("0.5.0")}
+    monkeypatch.setattr(install.urllib.request, "urlopen", _fake_urlopen(responses))
+    rc = install.main(["--ref", "main", "--repo", _REPO, "--hermes-home", str(home)])
+    assert rc == 0
+    installed = yaml.safe_load((home / "plugins" / NAME / "plugin.yaml").read_text())
+    assert installed["version"] == "0.5.0"
+    config = yaml.safe_load((home / "config.yaml").read_text())
+    assert NAME in config["plugins"]["enabled"]
+
+
+def test_install_ref_dry_run_reports_ref_source_without_changes(tmp_path, capsys):
+    home = tmp_path / "hermes"
+    rc = install.main(
+        ["--ref", "main", "--repo", _REPO, "--hermes-home", str(home), "--dry-run"]
+    )
+    assert rc == 0
+    assert "main" in capsys.readouterr().out
+    assert not (home / "plugins" / NAME).exists()
+
+
+@pytest.mark.parametrize("other", [["--version", "0.2.0"], ["--local"]])
+def test_install_ref_conflicts_with_other_sources(other):
+    # --ref shares the mutually exclusive source group with --version/--local, so
+    # combining them exits non-zero via argparse instead of installing.
+    with pytest.raises(SystemExit):
+        install.parse_args(["--ref", "main", *other])
+
+
 def test_install_idempotent_preserves_config(tmp_path):
     home = tmp_path / "hermes"
     home.mkdir()

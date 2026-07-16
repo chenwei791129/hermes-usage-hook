@@ -10,7 +10,9 @@ The script exposes an argparse CLI with two modes:
 * ``install`` (the default when no subcommand is given) — install the plugin.
   By default it downloads the latest GitHub release of the source repo and
   installs the ``plugin/`` directory found in its source tarball. ``--local``
-  installs from a local directory instead; ``--version`` pins a release tag.
+  installs from a local directory instead; ``--version`` pins a release tag;
+  ``--ref`` installs a branch/tag/commit source tarball (e.g. ``--ref main``
+  for the latest unreleased ``main``).
 * ``remove`` — delete the installed plugin directory and disable it in
   ``config.yaml``, with an optional ``--version`` guard.
 
@@ -224,6 +226,17 @@ def _http_get(url: str, *, accept_json: bool = False, verbose: bool = False) -> 
         return resp.read()
 
 
+def ref_tarball_url(repo: str, ref: str) -> str:
+    """Return the source-tarball URL for a branch, tag, or commit SHA.
+
+    Unlike ``resolve_release`` (which goes through the Releases API), this points
+    straight at GitHub's ``/tarball/{ref}`` endpoint so an unreleased ref such as
+    ``main`` can be installed. The ref is used verbatim, matching how
+    ``resolve_release`` passes tags through unencoded.
+    """
+    return f"{_GITHUB_API}/repos/{repo}/tarball/{ref}"
+
+
 def resolve_release(
     repo: str, version: str | None = None, verbose: bool = False
 ) -> dict:
@@ -372,6 +385,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     if args.local is not None:
         src = Path(args.local).expanduser()
         source_desc = f"local directory {src}"
+    elif args.ref:
+        source_desc = f"GitHub ref {args.ref!r} of {args.repo}"
     elif args.version:
         source_desc = f"GitHub release {args.version!r} of {args.repo}"
     else:
@@ -395,15 +410,21 @@ def cmd_install(args: argparse.Namespace) -> int:
             )
         installed = install_plugin_dir(src, hermes_home, PLUGIN_NAME)
     else:
-        release = resolve_release(args.repo, args.version, verbose=args.verbose)
-        tarball_url = release.get("tarball_url")
-        if not tarball_url:
-            raise InstallerError(
-                f"release for {args.repo} has no source tarball; use --local to "
-                f"install from a local directory"
-            )
-        if args.verbose:
-            print(f"Resolved release tag: {release.get('tag_name')}", file=sys.stderr)
+        if args.ref:
+            tarball_url = ref_tarball_url(args.repo, args.ref)
+        else:
+            release = resolve_release(args.repo, args.version, verbose=args.verbose)
+            tarball_url = release.get("tarball_url")
+            if not tarball_url:
+                raise InstallerError(
+                    f"release for {args.repo} has no source tarball; use --local "
+                    f"to install from a local directory"
+                )
+            if args.verbose:
+                print(
+                    f"Resolved release tag: {release.get('tag_name')}",
+                    file=sys.stderr,
+                )
         with tempfile.TemporaryDirectory() as tmp:
             plugin_dir = download_and_locate_plugin(
                 tarball_url, Path(tmp), verbose=args.verbose
@@ -491,6 +512,13 @@ def _add_install_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="TAG",
         help="install a specific GitHub release tag instead of the latest",
+    )
+    source.add_argument(
+        "--ref",
+        default=None,
+        metavar="BRANCH_OR_SHA",
+        help="install from a branch, tag, or commit SHA's source tarball "
+        "(e.g. --ref main for the latest unreleased main) instead of a release",
     )
     parser.add_argument(
         "--repo",
