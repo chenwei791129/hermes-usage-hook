@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import logging
 
 import httpx
 import pytest
 
 from plugin import autoreset
+from plugin import autoreset_audit
 
 
 def _plugin_config(*, enabled=True, threshold=10):
@@ -24,7 +26,9 @@ def _plugin_config(*, enabled=True, threshold=10):
 
 
 def test_config_defaults_disabled_threshold_zero():
-    assert autoreset.load_autoreset_config(env={}, config={}) == autoreset.AutoResetConfig(
+    assert autoreset.load_autoreset_config(
+        env={}, config={}
+    ) == autoreset.AutoResetConfig(
         enabled=False,
         threshold=0,
     )
@@ -260,9 +264,7 @@ def test_ignores_redeemed_and_unusable_rows():
 def test_positive_count_but_no_valid_id_fails_closed():
     assert (
         autoreset.select_earliest_available_credit(
-            _credit_payload(
-                _credit("", "2026-07-18T00:40:00Z"), available_count=1
-            )
+            _credit_payload(_credit("", "2026-07-18T00:40:00Z"), available_count=1)
         )
         is None
     )
@@ -327,9 +329,7 @@ def test_state_uses_hermes_home_and_contains_no_credentials(monkeypatch, tmp_pat
         }
     )
 
-    assert store.path == (
-        tmp_path / "state" / "hermes-usage-hook" / "autoreset.json"
-    )
+    assert store.path == (tmp_path / "state" / "hermes-usage-hook" / "autoreset.json")
     serialized = store.path.read_text()
     for forbidden in (
         "must-not-persist",
@@ -410,9 +410,7 @@ def test_stale_lock_can_be_reclaimed_once(tmp_path):
 def test_stale_reclaimer_never_steals_fresh_replacement(tmp_path):
     lock_path = tmp_path / "state" / autoreset.PLUGIN_ID / "autoreset.lock"
     lock_path.mkdir(parents=True)
-    (lock_path / "owner.json").write_text(
-        '{"owner":"stale-owner","created_at":1000.0}'
-    )
+    (lock_path / "owner.json").write_text('{"owner":"stale-owner","created_at":1000.0}')
     observed_identity = autoreset._lock_identity(lock_path)
     assert observed_identity is not None
 
@@ -453,9 +451,7 @@ def test_expired_notice_is_pruned_after_twenty_four_hours(tmp_path):
     assert store.queue_notice("session-a", "expired", now=1_000.0)
 
     assert (
-        store.pop_notice(
-            "session-a", now=1_000.0 + autoreset.NOTICE_TTL_SECONDS + 0.1
-        )
+        store.pop_notice("session-a", now=1_000.0 + autoreset.NOTICE_TTL_SECONDS + 0.1)
         is None
     )
 
@@ -1034,7 +1030,9 @@ def test_initial_usage_fetch_failure_sets_one_minute_cooldown_and_preserves_stat
 def _http_status_error(status_code):
     request = httpx.Request("POST", "https://chatgpt.com/backend-api/test")
     response = httpx.Response(status_code, request=request)
-    return httpx.HTTPStatusError("backend rejected request", request=request, response=response)
+    return httpx.HTTPStatusError(
+        "backend rejected request", request=request, response=response
+    )
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
@@ -1243,9 +1241,9 @@ def test_terminal_success_write_atomically_contains_audit_notice(monkeypatch, tm
     assert queue_calls == []
     assert len(terminal_writes) == 1
     assert terminal_writes[0]["pending"] is None
-    assert terminal_writes[0]["fallback_notices"]["sess-atomic"][
-        "message"
-    ].startswith("Codex auto reset")
+    assert terminal_writes[0]["fallback_notices"]["sess-atomic"]["message"].startswith(
+        "Codex auto reset"
+    )
 
 
 def test_failed_atomic_terminal_write_preserves_pending_for_safe_retry(
@@ -1379,3 +1377,164 @@ def test_pending_and_cooldown_writes_preserve_existing_notice(tmp_path):
     assert result.status == "no_credit"
     assert store.cooldown_active(store.load(), now=1_000.0)
     assert store.pop_notice("sess-earlier", now=1_001.0) == "earlier notice"
+
+
+# --- Best-effort success-history append (autoreset_audit integration) ---------
+
+
+def _history_file(home):
+    return home / "logs" / "hermes-usage-hook-autoreset.jsonl"
+
+
+def test_success_reset_appends_exactly_one_history_event(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "reset"}),
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "reset"
+    lines = _history_file(tmp_path).read_text().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["backend_status"] == "reset"
+    assert event["weekly_before"] == 5
+    assert event["weekly_after"] == 100
+    assert event["event_id"].startswith("sha256:")
+    # The raw redeem request ID is never persisted.
+    assert "req-1" not in lines[0]
+
+
+def test_idempotent_retry_does_not_duplicate_event(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+    _seed_pending(store)
+    # A prior success already recorded the event for this request ID.
+    autoreset_audit.append_success_event(
+        autoreset_audit.build_success_event(
+            redeem_request_id="req-1",
+            observed_at=1_000.0,
+            backend_status="reset",
+            weekly_before=5,
+            weekly_after=100,
+            credits_before=1,
+            credits_after=0,
+        ),
+        home=tmp_path,
+    )
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=0),
+        ),
+        credit_lister=_never,
+        consumer=_Consumer(response={"status": "already_redeemed"}),
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "already_redeemed"
+    lines = _history_file(tmp_path).read_text().splitlines()
+    assert len(lines) == 1
+
+
+def test_success_cooldown_prevents_a_second_history_event(tmp_path):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    first = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(
+            _eligible_usage(remaining=5),
+            _eligible_usage(remaining=100, credits=1),
+        ),
+        credit_lister=_Lister(_valid_credit_list()),
+        consumer=_Consumer(response={"status": "reset"}),
+        uuid_factory=_Uuids("req-1"),
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+    second = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_never,
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_never,
+        clock=lambda: 1_001.0,
+    )
+
+    assert first.status == "reset"
+    assert second.status == "cooldown"
+    lines = _history_file(tmp_path).read_text().splitlines()
+    assert len(lines) == 1
+
+
+class _ExplodingAudit:
+    """Audit double whose append blows up with sensitive detail in the message."""
+
+    def build_success_event(self, **_kwargs):
+        return {"event_id": "sha256:" + "0" * 64}
+
+    def append_success_event(self, _event, *, home=None):
+        raise RuntimeError("disk on fire: SENSITIVE-BACKEND-PAYLOAD")
+
+
+def test_history_append_failure_leaves_reset_outcome_and_notice_intact(
+    tmp_path, caplog
+):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    with caplog.at_level(logging.WARNING):
+        result = autoreset.maybe_autoreset(
+            model="gpt-5-codex",
+            usage=_eligible_usage(remaining=5),
+            session_id="sess-1",
+            config=_enabled_config(threshold=10),
+            store=store,
+            usage_fetcher=_Fetcher(
+                _eligible_usage(remaining=5),
+                _eligible_usage(remaining=100, credits=1),
+            ),
+            credit_lister=_Lister(_valid_credit_list()),
+            consumer=_Consumer(response={"status": "reset"}),
+            uuid_factory=_Uuids("req-1"),
+            lock_factory=_LockFactory(True),
+            clock=lambda: 1_000.0,
+            audit_log=_ExplodingAudit(),
+        )
+
+    # Reset outcome and notice are exactly what they would be without history.
+    assert result.status == "reset"
+    assert result.before_remaining == 5
+    assert result.after_remaining == 100
+    assert result.after_credits == 1
+    assert result.notice_persisted is True
+    assert result.message
+    assert store.pop_fallback_notice("sess-1", now=1_000.0) == result.message
+    # Only a static warning is logged; no exception detail leaks.
+    assert "auto-reset history append failed" in caplog.text
+    assert "SENSITIVE-BACKEND-PAYLOAD" not in caplog.text
+    assert "disk on fire" not in caplog.text
