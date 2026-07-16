@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import sys
-import types
 
 import pytest
 
@@ -29,12 +28,10 @@ def test_injected_home_takes_precedence(tmp_path):
     assert hermes_home.resolve_hermes_home(tmp_path) == tmp_path
 
 
-def test_uses_get_hermes_home_when_module_importable(monkeypatch, tmp_path):
-    fake = types.ModuleType("hermes_constants")
-    fake.get_hermes_home = lambda: tmp_path / "profile-home"
-    monkeypatch.setitem(sys.modules, "hermes_constants", fake)
+def test_uses_get_hermes_home_when_module_importable(tmp_path, fake_hermes_constants):
+    profile_home = fake_hermes_constants(tmp_path / "profile-home")
 
-    assert hermes_home.resolve_hermes_home() == tmp_path / "profile-home"
+    assert hermes_home.resolve_hermes_home() == profile_home
 
 
 def test_falls_back_to_env_when_module_absent(monkeypatch, tmp_path):

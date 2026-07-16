@@ -181,11 +181,10 @@ def usagehook_command(args: str = "", **_kwargs) -> str:
         count = _parse_history_count(args.split() if args else [])
         if count is None:
             return _USAGEHOOK_USAGE
-        # Read from the same home the coordinator writes to: the success path
-        # anchors the history file to the state store's home, so resolving it any
-        # other way here (e.g. an un-injected profile-safe lookup) could point at
-        # a different directory and report an empty history despite real resets.
-        events = autoreset_audit.read_events(home=AutoResetStateStore().home)
+        # Read and write both resolve through the one profile-safe resolver, so
+        # the default resolution here lands on the same home the coordinator
+        # wrote to; no injected store home is needed to force agreement.
+        events = autoreset_audit.read_events()
         if not events:
             return _USAGEHOOK_EMPTY
         selected = events[-count:]
