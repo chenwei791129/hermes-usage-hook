@@ -68,6 +68,33 @@ Python standard library.
 different install source. The default install needs network access to reach
 GitHub; offline, clone the repo and use `--local`.
 
+### Installing through Hermes' own plugin manager
+
+`hermes plugins install` and the dashboard's Git install field take the same
+identifier. The plugin lives in this repo's `plugin/` subdirectory, so the
+identifier **must name that subdirectory**:
+
+```
+chenwei791129/hermes-usage-hook/plugin
+```
+
+`https://github.com/chenwei791129/hermes-usage-hook/tree/main/plugin` and
+`https://github.com/chenwei791129/hermes-usage-hook.git#plugin` are equivalent.
+
+Omit `/plugin` and Hermes copies the **whole repository** — tests, specs, git
+metadata and all — into your plugins directory. Nothing visibly fails, because
+Hermes treats a manifest-less install directory as a namespace and finds the
+nested `plugin/plugin.yaml` one level down; you simply end up with a repo
+checkout where a plugin should be. Remove it and reinstall with the
+subdirectory.
+
+Either way the installed directory contains no `.git`, so `hermes plugins
+update` and the dashboard's update action report the plugin as not updatable —
+upgrading means removing and installing again. Upstream tracks this in
+[issue #65314](https://github.com/NousResearch/hermes-agent/issues/65314) and
+[PR #65337](https://github.com/NousResearch/hermes-agent/pull/65337). The
+`install.py` path is equally `.git`-less, but re-running it upgrades in place.
+
 ## After installing
 
 Each provider reads its own credentials, and without them that provider's
