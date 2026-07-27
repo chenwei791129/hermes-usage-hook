@@ -234,6 +234,9 @@ def test_install_local_copies_and_enables(tmp_path):
     rc = install.main(["--local", "--hermes-home", str(home)])
     assert rc == 0
     assert (home / "plugins" / NAME / "plugin.yaml").is_file()
+    # The post-install notice lives in the plugin root, so copying the plugin
+    # directory carries it along without any installer change.
+    assert (home / "plugins" / NAME / "after-install.md").is_file()
     config = yaml.safe_load((home / "config.yaml").read_text())
     assert NAME in config["plugins"]["enabled"]
 

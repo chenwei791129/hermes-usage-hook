@@ -187,6 +187,7 @@ tier, so the `| plan …` segment is omitted.
 | `plugin/providers/codex_usage.py` | Read `auth.json` (read-only), fetch and normalize Codex usage, list reset credits, and POST one idempotent reset-credit consume attempt. |
 | `plugin/providers/minimax_usage.py` | Resolve the MiniMax API token, fetch and normalize MiniMax usage. |
 | `plugin/hooks/footer_hook.py` | The Hermes hook module that registers the footer and Codex preflight hooks, the `/usagehook` history command, appends usage, and renders auto-reset audit notices. |
+| `plugin/after-install.md` | Post-install notice: the setup panel Hermes' own `hermes plugins install` command renders after a successful install. Neither `install.py` nor the dashboard renders it. |
 
 ## Local development
 
@@ -302,8 +303,8 @@ explicitly. So installation is two steps: install the directory, then enable it.
 
 **1. Install the plugin directory.** All plugin files live under the repo's
 `plugin/` subdirectory; install that subdirectory (not the whole repo, which
-also carries `tests/`, `openspec/`, and git metadata) into Hermes' plugins
-directory as `hermes-usage-hook/`:
+also carries `tests/`, `openspec/`, `pyproject.toml`, and git metadata) into
+Hermes' plugins directory as `hermes-usage-hook/`:
 
 ```bash
 git clone git@github.com:chenwei791129/hermes-usage-hook.git
@@ -335,6 +336,79 @@ install uses a non-default home.
 
 > **Streaming caveat:** if your deployment streams responses, the reply body is
 > already sent before this hook runs, so the footer may not be applied.
+
+### Dashboard install (alternative)
+
+The Hermes dashboard's plugin management page can install a plugin straight from
+Git. That path does not run `install.py`: it clones a repository, optionally
+moves one subdirectory of it into your plugins directory, reads that directory's
+`plugin.yaml` for the plugin name, and adds the name to `plugins.enabled`.
+
+It is the weakest of the three paths — it cannot pin a version, and the install
+it produces can never be updated in place (both below). Prefer `install.py`
+unless you want to stay in the dashboard UI.
+
+**Name the `plugin/` subdirectory in the identifier.** The shorthand form is
+`<owner>/<repo>/plugin`:
+
+```text
+chenwei791129/hermes-usage-hook/plugin
+```
+
+Two other spellings are accepted and install the same thing:
+
+```text
+https://github.com/chenwei791129/hermes-usage-hook/tree/main/plugin
+https://github.com/chenwei791129/hermes-usage-hook.git#plugin
+```
+
+A tree URL's `<branch>` segment is ignored — the install always clones the
+default branch, so that spelling selects the default branch, not the branch you
+named.
+
+> **Do not omit the subdirectory.** A bare `<owner>/<repo>` copies the *whole
+> repository* — `tests/`, `openspec/`, `pyproject.toml`, and git metadata — into
+> your plugins directory, and nothing in the dashboard flags it, because the
+> plugin still loads: Hermes treats the manifest-less installed directory as a
+> category namespace, scans one level deeper, finds the nested
+> `plugin/plugin.yaml`, and matches the plugin name the dashboard wrote to
+> `plugins.enabled`. What you are left with is an entire repository sitting in
+> your plugins directory, the plugin registered under a nested key, and still no
+> update action — the registered directory is the nested `plugin/`, which holds
+> no `.git`. Remove such an install and redo it with the `/plugin` suffix.
+
+**Install source and updates.** This path installs the default branch's latest
+commit; the identifier cannot pin a branch, tag, or release, unlike `install.py`,
+whose default source is the latest GitHub release. And moving a subdirectory out
+of the clone leaves no `.git` in the installed plugin, so the dashboard's update
+action is unavailable for it — to update, remove the plugin and install it again.
+
+**After the install.** The dashboard does not show the plugin's post-install
+notice (`plugin/after-install.md`), so its steps are repeated here:
+
+- Codex usage needs ChatGPT **OAuth** credentials, read from Hermes' `auth.json`
+  or the Codex CLI auth store (`codex login` creates the latter). An
+  API-key-only `auth.json` is rejected, and without usable credentials the Codex
+  footer is omitted.
+- Codex auto reset is **disabled by default**. Enabling
+  `plugins.entries.hermes-usage-hook.auto_reset.enabled` is explicit standing
+  authorization for the plugin to autonomously consume a reset credit, which is
+  irreversible. See [Codex auto reset](#codex-auto-reset) and
+  [Reset history](#reset-history).
+- If your deployment streams responses, the reply body is already sent before
+  this hook runs, so the footer may not be applied.
+
+For MiniMax replies also set `MINIMAX_API_KEY` (see [MiniMax usage](#minimax-usage)),
+then restart Hermes.
+
+**Observed on Hermes 0.19.0.** Upstream tracks both quirks: issue **65314** (a
+subdirectory install discards `.git`, leaving the update action permanently
+unavailable) and pull request **65337** (records install-source metadata so
+updates no longer need an in-place `.git`, and autodetects the repository's
+single subdirectory holding both `plugin.yaml` and `__init__.py` — this repo's
+`plugin/` qualifies). Merging 65337 makes both the whole-repository warning and
+the unavailable-update-action statement above obsolete, so revisit this section
+then.
 
 ## Troubleshooting
 
