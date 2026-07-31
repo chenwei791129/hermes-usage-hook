@@ -1,9 +1,12 @@
 name: release-please
 
+# This branch is the 0.4.x maintenance line, cut from v0.4.0 so a patch can
+# ship while main carries unreleased features. It only reacts to pushes on
+# itself; main keeps its own copy of this workflow targeting main.
 on:
   push:
     branches:
-      - main
+      - release-0.4
 
 permissions:
   contents: write
@@ -23,4 +26,10 @@ jobs:
     steps:
       # config-file / manifest-file omitted: the files use release-please's
       # default names (release-please-config.json, .release-please-manifest.json).
+      #
+      # target-branch pins release-please to this branch, so it versions off
+      # this branch's manifest (0.4.0) and only sees commits landed here --
+      # main's unreleased features never enter this line's version bump.
       - uses: googleapis/release-please-action@v5
+        with:
+          target-branch: release-0.4
