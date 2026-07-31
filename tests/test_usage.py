@@ -301,7 +301,92 @@ def test_format_summary_omits_reset_clause_when_unknown():
     )
 
 
-# --- Footer hook failure handling (Failure never breaks the reply) -------------
+# --- Footer hook silence and failure handling ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "NO_REPLY",
+        "NO REPLY",
+        "SILENT",
+        "[SILENT]",
+        "  no_reply\n",
+        ".NO_REPLY",
+        "*NO_REPLY*",
+        "—NO_REPLY—",
+    ],
+)
+def test_footer_leaves_intentional_silence_unchanged_without_usage_fetch(
+    monkeypatch, marker
+):
+    def fail_fetch(_model):
+        pytest.fail("silence markers must skip the usage fetch")
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", fail_fetch)
+
+    assert footer_hook.append_usage_footer(marker, model="gpt-5-codex") == marker
+
+
+def test_silence_marker_result_stops_later_transformers(monkeypatch):
+    marker = "NO_REPLY"
+    later_transform_called = False
+
+    def fail_fetch(_model):
+        pytest.fail("silence markers must skip the usage fetch")
+
+    def later_transform(response_text):
+        nonlocal later_transform_called
+        later_transform_called = True
+        return f"{response_text}\ntracking footer"
+
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", fail_fetch)
+    transformed = marker
+    for transform in (
+        lambda response_text: footer_hook.append_usage_footer(
+            response_text, model="gpt-5-codex"
+        ),
+        later_transform,
+    ):
+        result = transform(marker)
+        if result:
+            transformed = result
+            break
+
+    assert transformed == marker
+    assert later_transform_called is False
+
+
+def test_silence_matcher_rejects_non_string_values():
+    assert footer_hook._is_silence_marker({"response": "NO_REPLY"}) is False
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "The model returned NO_REPLY unexpectedly.",
+        "[SILENT",
+        f"NO_REPLY {'x' * 64}",
+    ],
+)
+def test_footer_does_not_treat_substantive_or_malformed_text_as_silence(
+    monkeypatch, reply
+):
+    monkeypatch.setattr(
+        footer_hook,
+        "get_usage_for_model",
+        lambda _model: _codex_usage(remaining=10, credits=3),
+    )
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("disabled"),
+    )
+
+    result = footer_hook.append_usage_footer(reply, model="gpt-5-codex")
+
+    assert result is not None
+    assert result.startswith(f"{reply}\n\n───\nCodex weekly")
 
 
 def test_footer_logs_prefixed_error_and_leaves_reply_unchanged(monkeypatch, capsys):

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import unicodedata
 
 from .. import autoreset_audit
 from ..autoreset import AutoResetStateStore, maybe_autoreset
@@ -45,7 +46,52 @@ _USAGEHOOK_EMPTY = "No Codex auto-reset history yet."
 _HISTORY_DEFAULT_COUNT = 5
 _HISTORY_MAX_COUNT = 100
 
+# Keep this small and explicit to mirror the host's intentional-silence filter.
+# Importing the host helper would couple the standalone plugin to host internals.
+_SILENCE_MARKERS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
+_SILENCE_MARKER_MAX_LENGTH = 64
+
 logger = logging.getLogger(__name__)
+
+
+def _canonical_silence_marker(text: str) -> str:
+    return " ".join(text.strip().upper().split())
+
+
+def _strip_edge_silence_punctuation(text: str) -> str:
+    """Strip stray edge punctuation while preserving square brackets."""
+    start = 0
+    end = len(text)
+    while (
+        start < end
+        and text[start] not in "[]"
+        and unicodedata.category(text[start]).startswith("P")
+    ):
+        start += 1
+    while (
+        end > start
+        and text[end - 1] not in "[]"
+        and unicodedata.category(text[end - 1]).startswith("P")
+    ):
+        end -= 1
+    return text[start:end].strip()
+
+
+def _is_silence_marker(text: object) -> bool:
+    """Return whether the whole reply is a host intentional-silence marker."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped) > _SILENCE_MARKER_MAX_LENGTH:
+        return False
+    exact = _canonical_silence_marker(stripped)
+    without_edge_punctuation = _strip_edge_silence_punctuation(stripped)
+    if exact in _SILENCE_MARKERS:
+        return True
+    return (
+        without_edge_punctuation != stripped
+        and _canonical_silence_marker(without_edge_punctuation) in _SILENCE_MARKERS
+    )
 
 
 def register(ctx):
@@ -174,15 +220,20 @@ def _pop_notice(session_id: str) -> str | None:
 
 
 def append_usage_footer(response_text: str, **kwargs) -> str | None:
-    """Append the usage footer; return None to leave the response unchanged.
+    """Append usage, preserve silence markers, or return None for no change.
 
     Detects the provider from the current reply's ``model`` and fetches that
-    provider's usage, rendering its ``5h`` and ``weekly`` windows. An
-    unrecognized model, or any fetch failure, leaves the reply unchanged
-    (returns None).
+    provider's usage, rendering its ``5h`` and ``weekly`` windows. Intentional
+    silence markers are returned unchanged to stop subsequent transform hooks;
+    an unrecognized model or fetch failure returns None.
     """
     if not response_text:
         return None
+    if _is_silence_marker(response_text):
+        # A non-empty string wins the host's transform hook chain. Returning the
+        # marker unchanged prevents a later transformer from appending content
+        # that would make the host's intentional-silence filter miss it.
+        return response_text
     try:
         model = kwargs.get("model")
         session_id = kwargs.get("session_id") or ""
