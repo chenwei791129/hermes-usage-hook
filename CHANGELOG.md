@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.4.0...v0.4.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* preserve intentional silence responses ([803c976](https://github.com/chenwei791129/hermes-usage-hook/commit/803c976822be30acea22ba7166938d8a9e7576ea))
+
 ## [0.4.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.3.0...v0.4.0) (2026-07-13)
 
 
