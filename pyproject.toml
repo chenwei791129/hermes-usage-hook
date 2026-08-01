@@ -2,10 +2,9 @@
 # Development workspace metadata only. This project is NOT a distributable
 # package: install.py ships only the plugin/ directory, so this file never
 # reaches the installed plugin (see [tool.uv] package = false below).
-# The version below is synchronized with plugin/plugin.yaml by release-please;
-# it is kept here for parity only and is never published (package = false).
+# Fixed development-only version; plugin releases are versioned independently.
 name = "hermes-codex-usage-hook"
-version = "0.4.0" # x-release-please-version
+version = "0.0.0"
 requires-python = ">=3.10"
 # Runtime deps pinned to the Hermes host versions so local tests and standalone
 # quick-checks run against the exact versions Hermes provides at plugin load.

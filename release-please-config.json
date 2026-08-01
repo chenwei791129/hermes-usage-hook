@@ -3,8 +3,7 @@
     ".": {
       "release-type": "simple",
       "extra-files": [
-        "plugin/plugin.yaml",
-        "pyproject.toml"
+        "plugin/plugin.yaml"
       ]
     }
   }
