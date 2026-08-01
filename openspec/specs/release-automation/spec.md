@@ -34,20 +34,21 @@ The repository SHALL contain `release-please-config.json` and `.release-please-m
 - **AND** `.release-please-manifest.json` maps `"."` to `0.1.0`
 
 ---
-### Requirement: Synchronized version across plugin manifest and pyproject
+### Requirement: Synchronize the shipped plugin version from the release manifest
 
-release-please SHALL update both `plugin/plugin.yaml` and `pyproject.toml` version strings on each release. The config's `extra-files` SHALL list both files, and each file's version line SHALL carry an `x-release-please-version` anchor comment so the generic updater can locate and rewrite it. The `pyproject.toml` version SHALL be `0.1.0` (no longer a placeholder `0`), and its version-related comment SHALL state that the version is synchronized by release-please while the project remains non-distributable (`package = false`).
+release-please SHALL treat `.release-please-manifest.json` as the release version source and SHALL update the version in `plugin/plugin.yaml` on each release. The config's `extra-files` SHALL list `plugin/plugin.yaml`, whose version line SHALL carry an `x-release-please-version` anchor comment. The config SHALL NOT list the development-only `pyproject.toml` or generated `uv.lock` as release version targets.
 
-#### Scenario: Both version files carry the release-please anchor
+#### Scenario: Release configuration targets only the shipped version file
 
-- **WHEN** `plugin/plugin.yaml` and `pyproject.toml` are inspected
-- **THEN** each version line carries an `x-release-please-version` anchor comment
-- **AND** both versions read `0.1.0`
-- **AND** `release-please-config.json` lists both files under `extra-files`
+- **WHEN** `release-please-config.json` is inspected
+- **THEN** package `.` uses the `simple` release type
+- **AND** its `extra-files` list contains `plugin/plugin.yaml`
+- **AND** its `extra-files` list does not contain `pyproject.toml` or `uv.lock`
+- **AND** the version line in `plugin/plugin.yaml` carries an `x-release-please-version` anchor comment
+- **AND** that version matches package `.` in `.release-please-manifest.json`
 
-#### Scenario: pyproject version comment reflects release-please ownership
+#### Scenario: Development metadata cannot drift after a release bump
 
-- **WHEN** the version-related comment in `pyproject.toml` is read
-- **THEN** it states the version is synchronized by release-please
-- **AND** it does not claim the version is a meaningless placeholder
-- **AND** `pyproject.toml` still sets `package = false` under `[tool.uv]`
+- **WHEN** release-please updates the manifest and shipped plugin version for a release
+- **THEN** `pyproject.toml` and the virtual workspace package entry in `uv.lock` retain the fixed development-only version `0.0.0`
+- **AND** neither file contains a release-please updater anchor requiring synchronization
