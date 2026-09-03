@@ -14,7 +14,7 @@ Codex 現在提供 banked rate-limit reset credits，且 ChatGPT backend API 支
 
 ## Non-Goals
 
-- 不自動 reset 5h、daily、monthly、annual 或其他非 weekly window。
+- 不以 5h、daily、monthly、annual 或其他非 weekly window 作為觸發條件（消耗一張 credit 本來就會連同 5h 一起 reset，但那是 backend 的副作用，不是本 change 的觸發依據）。
 - 不在 effective `auto_reset.enabled` 為 false 時增加 pre-request usage API 呼叫。
 - 不提供排程背景 polling；只在 Hermes 對話生命週期 hook 被觸發時檢查。
 - 不新增手動 `/codex-reset` 指令。

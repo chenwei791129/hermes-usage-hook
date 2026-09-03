@@ -89,7 +89,7 @@ plugins:
         threshold: 0
 ```
 
-`threshold` 是 weekly remaining 語意，只接受 `0..99`，資格判定為 `weekly remaining <= threshold`。`100` 故意不合法——剛 reset 完的 weekly 視窗 remaining 是 100%，會立刻再次符合條件。環境變數 `CODEX_ENABLE_AUTORESET`、`CODEX_AUTORESET_THRESHOLD` 供 process-managed 部署覆寫，優先序是 env → plugin config → 預設值。plugin config 每次 hook 呼叫都經 Hermes `load_config()` 重讀，所以改 `config.yaml` 不必重裝 plugin；改 process environment 要重啟 / reload Gateway。OAuth 憑證不屬於 plugin config。
+消耗一張 credit 會同時 reset 帳號的 5h 與 weekly 兩個視窗，但**資格判定只看 weekly**：5h 用完不會觸發 auto reset。`threshold` 是 weekly remaining 語意，只接受 `0..99`，資格判定為 `weekly remaining <= threshold`。`100` 故意不合法——剛 reset 完的 weekly 視窗 remaining 是 100%，會立刻再次符合條件。環境變數 `CODEX_ENABLE_AUTORESET`、`CODEX_AUTORESET_THRESHOLD` 供 process-managed 部署覆寫，優先序是 env → plugin config → 預設值。plugin config 每次 hook 呼叫都經 Hermes `load_config()` 重讀，所以改 `config.yaml` 不必重裝 plugin；改 process environment 要重啟 / reload Gateway。OAuth 憑證不屬於 plugin config。
 
 Hermes 對 `plugins.entries.<plugin_id>` 的文件是 plugin LLM trust 設定（<https://hermes-agent.nousresearch.com/docs/developer-guide/plugin-llm-access#trust-gate>）。本 plugin 是從同一個 plugin entry 用 `load_config()` 讀自己的 `auto_reset.*` schema；Hermes 沒有為這些值提供通用的 plugin-config UI 或 schema。
 

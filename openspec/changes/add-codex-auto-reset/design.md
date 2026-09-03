@@ -2,13 +2,13 @@
 
 The plugin already calls the Codex usage endpoint and normalizes Codex weekly usage plus the available reset-credit count. The Codex client also exposes a reset-credit *list* endpoint to enumerate credits and a reset-credit *consume* endpoint that takes a redeem request id and an optional credit id to consume one.
 
-A live test confirmed the consume endpoint returns HTTP 200 with a success code, resets one weekly window to 0% used, and decrements the available reset-credit count. Consumption is irreversible and must be idempotent.
+A live test confirmed the consume endpoint returns HTTP 200 with a success code, resets the account's rate-limit windows (both the 5h and the weekly window) to 0% used, and decrements the available reset-credit count. Consumption is irreversible and must be idempotent.
 
 The existing `transform_llm_output` hook runs only after a successful response, so a footer-only design can miss `threshold=0` when the provider rejects the request first. Hermes also exposes `pre_llm_call`, which runs once before the request and includes the model.
 
 ## Goals
 
-- Automatically reset only the Codex weekly window after explicit effective plugin configuration.
+- Trigger auto reset on the Codex weekly window only, after explicit effective plugin configuration. A consumed credit still resets the 5h window as a side effect; the 5h window never gates eligibility.
 - Interpret the threshold as weekly remaining percentage.
 - Prevent duplicate consumption across dual hooks, concurrent cron/gateway work, retries, timeouts, and restarts.
 - Preserve the guarantee that provider/API failures never break a model response.
