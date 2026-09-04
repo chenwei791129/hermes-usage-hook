@@ -62,7 +62,7 @@ Do not include `pr-body.md` or credentials.
 - Create: `plugin/autoreset.py`
 - Create: `tests/test_autoreset.py`
 
-- [ ] **2.1 Write failing configuration tests.**
+- [x] **2.1 Write failing configuration tests.**
 
 Cover at minimum:
 
@@ -94,7 +94,7 @@ Use an injected full config dict shaped as:
 }
 ```
 
-- [ ] **2.2 Run the focused tests and verify RED.**
+- [x] **2.2 Run the focused tests and verify RED.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -k config -v
@@ -102,7 +102,7 @@ uv run pytest tests/test_autoreset.py -k config -v
 
 Expected: failures because `plugin.autoreset` and config resolution do not exist.
 
-- [ ] **2.3 Implement typed, lazy config resolution.**
+- [x] **2.3 Implement typed, lazy config resolution.**
 
 Add these public/internal shapes to `plugin/autoreset.py`:
 
@@ -144,7 +144,7 @@ Rules:
 - invalid explicit values return `valid=False, enabled=False` and never silently fall through to a lower-precedence value;
 - import `hermes_cli.config` only inside `_load_hermes_config`, because this standalone repo does not depend on Hermes during unit tests.
 
-- [ ] **2.4 Run focused tests and verify GREEN.**
+- [x] **2.4 Run focused tests and verify GREEN.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -k config -v
@@ -152,7 +152,7 @@ uv run ruff check plugin/autoreset.py tests/test_autoreset.py
 uv run ty check
 ```
 
-- [ ] **2.5 Commit the configuration slice.**
+- [x] **2.5 Commit the configuration slice.**
 
 ```bash
 git add plugin/autoreset.py tests/test_autoreset.py
@@ -167,7 +167,7 @@ git commit -m "feat: resolve Codex auto reset config"
 - Modify: `plugin/providers/codex_usage.py`
 - Modify: `tests/test_usage.py`
 
-- [ ] **3.1 Write failing provider tests without live HTTP.**
+- [x] **3.1 Write failing provider tests without live HTTP.**
 
 Add tests for:
 
@@ -183,13 +183,13 @@ def test_provider_errors_do_not_include_bearer_token(): ...
 
 Use a fake `httpx.Client`/`MockTransport`; never read the real `auth.json` and never call the live Codex backend in tests.
 
-- [ ] **3.2 Run the focused tests and verify RED.**
+- [x] **3.2 Run the focused tests and verify RED.**
 
 ```bash
 uv run pytest tests/test_usage.py -k "reset_credit or consume" -v
 ```
 
-- [ ] **3.3 Refactor shared authenticated JSON transport and add APIs.**
+- [x] **3.3 Refactor shared authenticated JSON transport and add APIs.**
 
 Add constants:
 
@@ -221,14 +221,14 @@ The POST body is exactly:
 
 Omit `credit_id` when `None`. Reuse `_load_auth()` and active account selection. Centralize headers without logging them. Keep generic POST retries forbidden—the coordinator owns retry timing and identifier reuse.
 
-- [ ] **3.4 Verify provider tests and existing normalization.**
+- [x] **3.4 Verify provider tests and existing normalization.**
 
 ```bash
 uv run pytest tests/test_usage.py -k "codex or reset_credit or consume" -v
 uv run ruff check plugin/providers/codex_usage.py tests/test_usage.py
 ```
 
-- [ ] **3.5 Commit the transport slice.**
+- [x] **3.5 Commit the transport slice.**
 
 ```bash
 git add plugin/providers/codex_usage.py tests/test_usage.py
@@ -245,7 +245,7 @@ git commit -m "feat: add Codex reset credit API client"
 - Modify: `tests/test_autoreset.py`
 - Modify: `tests/test_usage.py`
 
-- [ ] **4.1 Write failing policy and selection tests.**
+- [x] **4.1 Write failing policy and selection tests.**
 
 Cover:
 
@@ -280,13 +280,13 @@ Use the observed safe response shape:
 }
 ```
 
-- [ ] **4.2 Verify RED.**
+- [x] **4.2 Verify RED.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -k "eligible or credit or expiry" -v
 ```
 
-- [ ] **4.3 Expose Codex model matching and implement pure helpers.**
+- [x] **4.3 Expose Codex model matching and implement pure helpers.**
 
 In `plugin/usage.py`, rename/export the current matcher as a stable helper while preserving registry behavior:
 
@@ -304,7 +304,7 @@ def select_earliest_available_credit(payload: dict) -> dict | None: ...
 
 Do not infer weekly from position or reset timestamps. Require `credits` to be a list, `status == "available"`, and a non-empty string `id`. Parse ISO-8601 `Z` safely. Sort valid non-null expiries earliest-first and null expiry last. Reject any row whose non-null `expires_at` is malformed; if no valid available row remains, fail the invocation closed.
 
-- [ ] **4.4 Verify GREEN and provider-registry regressions.**
+- [x] **4.4 Verify GREEN and provider-registry regressions.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -k "eligible or credit or expiry" -v
@@ -313,7 +313,7 @@ uv run ruff check plugin/autoreset.py plugin/usage.py tests
 uv run ty check
 ```
 
-- [ ] **4.5 Commit the pure-policy slice.**
+- [x] **4.5 Commit the pure-policy slice.**
 
 ```bash
 git add plugin/autoreset.py plugin/usage.py tests/test_autoreset.py tests/test_usage.py
@@ -328,7 +328,7 @@ git commit -m "feat: add Codex auto reset policy"
 - Modify: `plugin/autoreset.py`
 - Modify: `tests/test_autoreset.py`
 
-- [ ] **5.1 Write failing state/lock tests using `tmp_path`.**
+- [x] **5.1 Write failing state/lock tests using `tmp_path`.**
 
 Cover:
 
@@ -345,13 +345,13 @@ def test_notice_is_popped_once_for_matching_session(tmp_path): ...
 def test_empty_session_id_never_leaks_notice_across_sessions(tmp_path): ...
 ```
 
-- [ ] **5.2 Verify RED.**
+- [x] **5.2 Verify RED.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -k "state or lock or cooldown or notice" -v
 ```
 
-- [ ] **5.3 Implement state and locking without new dependencies.**
+- [x] **5.3 Implement state and locking without new dependencies.**
 
 State paths:
 
@@ -375,7 +375,7 @@ Implement:
 
 Use explicit injected `now`/clock values in tests—no sleeps.
 
-- [ ] **5.4 Verify GREEN.**
+- [x] **5.4 Verify GREEN.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -k "state or lock or cooldown or notice" -v
@@ -383,7 +383,7 @@ uv run ruff check plugin/autoreset.py tests/test_autoreset.py
 uv run ty check
 ```
 
-- [ ] **5.5 Commit the state slice.**
+- [x] **5.5 Commit the state slice.**
 
 ```bash
 git add plugin/autoreset.py tests/test_autoreset.py
@@ -398,7 +398,7 @@ git commit -m "feat: persist Codex auto reset attempts"
 - Modify: `plugin/autoreset.py`
 - Modify: `tests/test_autoreset.py`
 
-- [ ] **6.1 Write failing coordinator tests with injected fakes.**
+- [x] **6.1 Write failing coordinator tests with injected fakes.**
 
 Cover all approved outcomes and call ordering:
 
@@ -422,13 +422,13 @@ def test_hook_facing_api_never_raises(): ...
 
 Inject `usage_fetcher`, `credit_lister`, `consumer`, `uuid_factory`, state store, lock, and clock. Assert the persisted pending record exists before the fake consumer is called.
 
-- [ ] **6.2 Verify RED.**
+- [x] **6.2 Verify RED.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -k "coordinator or reset or timeout or redeemed or contender" -v
 ```
 
-- [ ] **6.3 Implement the coordinator.**
+- [x] **6.3 Implement the coordinator.**
 
 Add:
 
@@ -473,7 +473,7 @@ Ambiguous POST exceptions keep pending identifiers and set retry-after one minut
 
 A consume response of `reset` with a failed refresh must remain transparent: queue a truthful partial notice such as `Codex auto reset | reset accepted; usage refresh unavailable`, rather than claiming percentages or hiding the accepted mutation.
 
-- [ ] **6.4 Verify GREEN and all auto-reset tests.**
+- [x] **6.4 Verify GREEN and all auto-reset tests.**
 
 ```bash
 uv run pytest tests/test_autoreset.py -v
@@ -481,7 +481,7 @@ uv run ruff check plugin/autoreset.py tests/test_autoreset.py
 uv run ty check
 ```
 
-- [ ] **6.5 Commit the coordinator slice.**
+- [x] **6.5 Commit the coordinator slice.**
 
 ```bash
 git add plugin/autoreset.py tests/test_autoreset.py
@@ -498,7 +498,7 @@ git commit -m "feat: coordinate idempotent Codex auto reset"
 - Modify: `tests/test_usage.py`
 - Modify: `tests/test_plugin_manifest.py` if manifest tests already live there; otherwise keep them in `tests/test_usage.py`
 
-- [ ] **7.1 Write failing hook-contract tests.**
+- [x] **7.1 Write failing hook-contract tests.**
 
 Cover:
 
@@ -517,13 +517,13 @@ def test_manifest_declares_exactly_two_supported_hooks(): ...
 
 Also retain all existing MiniMax, unknown-model, and footer-format regressions.
 
-- [ ] **7.2 Verify RED.**
+- [x] **7.2 Verify RED.**
 
 ```bash
 uv run pytest tests/test_usage.py -k "register or preflight or footer or manifest" -v
 ```
 
-- [ ] **7.3 Integrate synchronous handlers.**
+- [x] **7.3 Integrate synchronous handlers.**
 
 `hermes_cli.plugins.invoke_hook()` calls callbacks synchronously and does not await coroutine results. Therefore both handlers MUST be plain `def`, not `async def`.
 
@@ -569,7 +569,7 @@ provides_hooks:
 
 Do not add `requires_env`; auto reset is optional and disabled by default.
 
-- [ ] **7.4 Verify GREEN.**
+- [x] **7.4 Verify GREEN.**
 
 ```bash
 uv run pytest tests/test_usage.py -k "register or preflight or footer or manifest" -v
@@ -578,7 +578,7 @@ uv run ruff check plugin/hooks/footer_hook.py plugin/plugin.yaml tests
 uv run ty check
 ```
 
-- [ ] **7.5 Commit the hook slice.**
+- [x] **7.5 Commit the hook slice.**
 
 ```bash
 git add plugin/hooks/footer_hook.py plugin/plugin.yaml tests
@@ -595,7 +595,7 @@ git commit -m "feat: trigger Codex auto reset from dual hooks"
 - Modify: `plugin/hooks/footer_hook.py` module docstring
 - Modify: `tests/test_install.py` only if installer/archive assertions require the new file or hook
 
-- [ ] **8.1 Add README documentation tests/assertions if the project uses them.**
+- [x] **8.1 Add README documentation tests/assertions if the project uses them.**
 
 At minimum assert README and shipped manifest mention:
 - `plugins.entries.hermes-usage-hook.auto_reset.enabled`;
@@ -608,7 +608,7 @@ At minimum assert README and shipped manifest mention:
 - internal/unstable ChatGPT backend API warning;
 - no OAuth values in plugin config.
 
-- [ ] **8.2 Update README with canonical YAML and CLI examples.**
+- [x] **8.2 Update README with canonical YAML and CLI examples.**
 
 Include:
 
@@ -634,7 +634,7 @@ https://hermes-agent.nousresearch.com/docs/developer-guide/plugin-llm-access#tru
 
 State clearly that Hermes documents `plugins.entries.<plugin_id>` for plugin LLM trust configuration, while `auto_reset.*` is this plugin's own schema read through Hermes `load_config()`; do not imply Hermes has a generic plugin-config UI/schema.
 
-- [ ] **8.3 Update architecture/file tables and operational notes.**
+- [x] **8.3 Update architecture/file tables and operational notes.**
 
 Add `plugin/autoreset.py`, dual hooks, state paths, cooldown behavior, disabled-mode network behavior, and audit example:
 
@@ -644,7 +644,7 @@ Codex auto reset | weekly 0% → 100% | reset credits 3 → 2
 
 Mention plugin config is read per hook invocation; process env changes need Gateway restart/reload. Do not add `requires_env` to the manifest.
 
-- [ ] **8.4 Verify docs/install regressions.**
+- [x] **8.4 Verify docs/install regressions.**
 
 ```bash
 uv run pytest tests/test_install.py -v
@@ -652,7 +652,7 @@ uv run pytest tests/test_usage.py -k "readme or manifest" -v
 uv run ruff check .
 ```
 
-- [ ] **8.5 Commit documentation.**
+- [x] **8.5 Commit documentation.**
 
 ```bash
 git add README.md plugin tests
@@ -666,7 +666,7 @@ git commit -m "docs: explain Codex auto reset configuration"
 **Files:**
 - No planned source changes; fix failures in the owning task's files and rerun.
 
-- [ ] **9.1 Run the complete quality gate.**
+- [x] **9.1 Run the complete quality gate.**
 
 ```bash
 uv run pytest
@@ -677,7 +677,7 @@ python -m compileall -q plugin
 
 Expected: all commands exit 0; no warnings about un-awaited coroutine hooks.
 
-- [ ] **9.2 Test installation in an isolated Hermes home.**
+- [x] **9.2 Test installation in an isolated Hermes home.**
 
 ```bash
 SMOKE_HOME="$(mktemp -d /tmp/hermes-usage-hook-smoke.XXXXXX)"
@@ -694,7 +694,7 @@ Verify:
 
 Do not delete the smoke directory as part of an unattended run; report its path so cleanup remains explicit.
 
-- [ ] **9.3 Test config parsing against an isolated real `config.yaml`.**
+- [x] **9.3 Test config parsing against an isolated real `config.yaml`.**
 
 ```bash
 HERMES_HOME="$SMOKE_HOME" hermes config set plugins.entries.hermes-usage-hook.auto_reset.enabled false
@@ -703,7 +703,7 @@ HERMES_HOME="$SMOKE_HOME" hermes config set plugins.entries.hermes-usage-hook.au
 
 Load the plugin and assert effective config is disabled/0 without calling usage or consume APIs.
 
-- [ ] **9.4 Audit the diff for secrets and scope.**
+- [x] **9.4 Audit the diff for secrets and scope.**
 
 ```bash
 git diff main...HEAD --check
@@ -751,7 +751,7 @@ Only when weekly remaining meets the configured threshold:
 - verify state completion and one audit footer;
 - never retry with a new UUID after an ambiguous timeout.
 
-- [ ] **10.4 Prepare English PR material and request publication confirmation.**
+- [x] **10.4 Prepare English PR material and request publication confirmation.**
 
 ```bash
 git log --oneline main..HEAD
@@ -766,16 +766,16 @@ Creating/pushing a public branch or PR is an external publication action: obtain
 ## Definition of Done
 
 - [ ] Approved OpenSpec files and this `tasks.md` are committed.
-- [ ] Plugin config is canonical; env overrides and defaults behave exactly as specified.
-- [ ] Disabled mode adds no pre-request network call.
-- [ ] Only real Codex weekly windows can qualify.
-- [ ] Earliest-expiring available credit is selected from the observed API shape.
-- [ ] Cross-process lock + lock-time recheck prevents concurrent double consumption.
-- [ ] Pending UUID and credit ID survive timeout/restart and are reused.
-- [ ] All outcomes/cooldowns are tested; hook errors never break replies.
-- [ ] Both registered hooks are synchronous and inject no prompt context.
-- [ ] Successful reset is visible once in the matching session footer.
-- [ ] State/logs/tests/docs contain no credentials or account/user IDs.
-- [ ] Full pytest, Ruff, ty, compileall, installer, and disabled smoke checks pass.
-- [ ] No live credit is consumed without a fresh explicit confirmation.
-- [ ] No public push/PR occurs without publication confirmation.
+- [x] Plugin config is canonical; env overrides and defaults behave exactly as specified.
+- [x] Disabled mode adds no pre-request network call.
+- [x] Only real Codex weekly windows can qualify.
+- [x] Earliest-expiring available credit is selected from the observed API shape.
+- [x] Cross-process lock + lock-time recheck prevents concurrent double consumption.
+- [x] Pending UUID and credit ID survive timeout/restart and are reused.
+- [x] All outcomes/cooldowns are tested; hook errors never break replies.
+- [x] Both registered hooks are synchronous and inject no prompt context.
+- [x] Successful reset is visible once in the matching session footer.
+- [x] State/logs/tests/docs contain no credentials or account/user IDs.
+- [x] Full pytest, Ruff, ty, compileall, installer, and disabled smoke checks pass.
+- [x] No live credit is consumed without a fresh explicit confirmation.
+- [x] No public push/PR occurs without publication confirmation.
