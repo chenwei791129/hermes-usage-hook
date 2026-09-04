@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.4.0...v0.5.0) (2026-09-04)
+
+
+### Features
+
+* add --ref to install from a branch, tag, or commit ([8bdc503](https://github.com/chenwei791129/hermes-usage-hook/commit/8bdc5039ae4592b953f591d8c2e5884458e5eb1e))
+* Codex auto-reset success history + /usagehook command ([#16](https://github.com/chenwei791129/hermes-usage-hook/issues/16)) ([0961321](https://github.com/chenwei791129/hermes-usage-hook/commit/09613218d6e173465133ed0dbf30c46f3fcffeac))
+
+
+### Bug Fixes
+
+* harden Codex credential and threshold handling ([d14b0da](https://github.com/chenwei791129/hermes-usage-hook/commit/d14b0dadf74e7001a82de74f13fe05b784f2f162))
+* preserve intentional silence responses ([502ea40](https://github.com/chenwei791129/hermes-usage-hook/commit/502ea4041c1dbcb9373837d7cefc9dee059e7d0a))
+* **release:** eliminate uv lock version drift ([7b099f5](https://github.com/chenwei791129/hermes-usage-hook/commit/7b099f5924db976824010f3787c5a7b0db147c56))
+* unify plugin Hermes home on the profile-safe resolver ([806af15](https://github.com/chenwei791129/hermes-usage-hook/commit/806af15fca962174f8a653bf5724d2af19334c70))
+
 ## [0.4.1](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.4.0...v0.4.1) (2026-07-31)
 
 
