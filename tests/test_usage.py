@@ -710,33 +710,57 @@ def test_manifest_declares_exactly_two_supported_hooks():
     assert "requires_env" not in manifest
 
 
-def test_readme_documents_codex_autoreset_configuration():
-    readme = Path("README.md").read_text()
+# Auto-reset documentation is split across three files by audience: the
+# post-install notice carries what an operator must decide before enabling it,
+# AGENTS.md carries the architecture and operational detail, and README.md only
+# points at the notice. Each file is asserted in the language it is written in.
+
+
+def test_after_install_documents_autoreset_optin():
+    notice = Path("plugin/after-install.md").read_text()
     required = [
         "plugins.entries.hermes-usage-hook.auto_reset.enabled",
         "plugins.entries.hermes-usage-hook.auto_reset.threshold",
+        "disabled by default",
+        "irreversible",
+        "standing authorization",
+        "weekly-remaining",
+        "0..99",
+        "/usagehook history",
+    ]
+    for needle in required:
+        assert needle in notice
+
+
+def test_agents_doc_documents_autoreset_internals():
+    agents = Path("AGENTS.md").read_text()
+    required = [
         "CODEX_ENABLE_AUTORESET",
         "CODEX_AUTORESET_THRESHOLD",
-        "disabled by default",
-        "threshold: 0",
-        "0..99",
-        "weekly remaining",
-        "irreversible",
-        "earliest-expiring",
-        "idempotent",
-        "internal, unstable ChatGPT backend API",
-        "OAuth credentials do not belong in plugin config",
-        "autoreset-notices.json",
-        "autoreset-notices.lock/",
-        "five-minute suppression window",
-        "same coordinator-locked atomic write",
-        "env → plugin config → defaults",
+        "env → plugin config → 預設值",
         "plugins.entries.<plugin_id>",
         "load_config()",
+        "0..99",
+        "weekly remaining",
+        "最早到期",
+        "冪等",
+        "ChatGPT 內部非公開 backend API",
+        "OAuth 憑證不屬於 plugin config",
+        "autoreset-notices.json",
+        "autoreset-notices.lock/",
+        "同一次 coordinator-locked 原子寫入",
+        "五分鐘抑制窗",
         "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2",
     ]
     for needle in required:
-        assert needle in readme
+        assert needle in agents
+
+
+def test_readme_points_to_after_install():
+    readme = Path("README.md").read_text()
+
+    assert "plugin/after-install.md" in readme
+    assert "optional Codex auto reset" in readme
 
 
 # --- Codex auth.json location (prefer Hermes' store, fall back to Codex CLI) ----
