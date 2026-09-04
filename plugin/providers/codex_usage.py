@@ -35,6 +35,7 @@ Run standalone for a quick check:
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -83,30 +84,87 @@ _POOL_STATUS_DEAD = "dead"
 _POOL_STATUS_EXHAUSTED = "exhausted"
 
 
-def _pool_record_usable(record: dict) -> bool:
-    """Whether a ``credential_pool`` record is one Hermes would still select.
+# Priority applied to a pooled record whose ``priority`` is missing or not a
+# usable number. Ranking must never compare a raw value against this default:
+# a ``null`` priority would raise TypeError and abort resolution.
+_DEFAULT_POOL_PRIORITY = 100
 
-    Mirrors Hermes' own rotation (``agent.credential_pool``): it excludes
-    ``dead`` credentials unconditionally and ``exhausted`` ones whose cooldown
-    window (``last_error_reset_at``) has not yet elapsed. Picking a credential
-    Hermes has retired would query the usage endpoint with a stale/invalid token
-    and show the wrong account (or silently drop the footer) while Hermes runs
-    on a healthy lower-priority credential.
 
-    For ``exhausted`` records with no recorded reset time we fall through and
-    let the live usage call be the source of truth, rather than replicating
-    Hermes' error-code-based TTL fallback.
+def _pool_record_selectable(record: object) -> bool:
+    """Whether a ``credential_pool`` record may be selected at all.
+
+    Excludes records that carry no usable token and ``dead`` ones: Hermes
+    writes ``dead`` when the credential was invalidated server-side, so every
+    call with it would be rejected and demoting it could not help.
     """
-    if not isinstance(record, dict) or not record.get("access_token"):
+    if not isinstance(record, dict):
         return False
-    status = record.get("last_status")
-    if status == _POOL_STATUS_DEAD:
+    access_token = record.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
         return False
-    if status == _POOL_STATUS_EXHAUSTED:
-        reset_at = record.get("last_error_reset_at")
-        if isinstance(reset_at, (int, float)) and reset_at > time.time():
-            return False
-    return True
+    return record.get("last_status") != _POOL_STATUS_DEAD
+
+
+def _numeric(value: object) -> float | None:
+    """Return ``value`` as a number, or None when it is not one.
+
+    Booleans are not numbers here: JSON ``true`` in a numeric field is bad data,
+    and Python would otherwise silently rank it as 1.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _pool_record_in_cooldown(record: dict, *, now: float) -> bool:
+    """Whether a selectable record is inside an ``exhausted`` cooldown at ``now``.
+
+    Hermes writes ``exhausted`` when the completions endpoint returned a quota
+    error, recording the reset time in ``last_error_reset_at``. That quota does
+    not gate the usage and reset-credit endpoints this module reads, so the
+    cooldown only demotes a record: it keeps the footer on the credential
+    Hermes actually rotated to while a healthy one exists, without making
+    resolution fail once every credential is exhausted (which is exactly when
+    auto reset must run).
+
+    A missing, non-numeric, or already elapsed reset time is not a cooldown.
+    ``now`` is passed in so one clock reading classifies every record in a
+    selection: re-reading the clock per record could split a tier mid-scan.
+    """
+    if record.get("last_status") != _POOL_STATUS_EXHAUSTED:
+        return False
+    reset_at = _numeric(record.get("last_error_reset_at"))
+    return reset_at is not None and reset_at > now
+
+
+def _pool_priority(record: dict) -> float:
+    """Sort key for a pooled record: its ``priority``, normalized to a number."""
+    priority = _numeric(record.get("priority"))
+    return _DEFAULT_POOL_PRIORITY if priority is None else priority
+
+
+def _select_pool_record(pool_records: list) -> dict | None:
+    """Pick the pooled record to read usage from, or None if none qualifies.
+
+    Prefers records that are not in an ``exhausted`` cooldown, ordered by
+    ascending priority; falls back to the cooled-down ones under the same rule.
+    False sorts before True, so the cooldown flag leads the key and demotes a
+    whole tier. ``min`` keeps the first of equal-key records, so ordering is
+    stable.
+    """
+    selectable = [record for record in pool_records if _pool_record_selectable(record)]
+    if not selectable:
+        return None
+    now = time.time()
+    return min(
+        selectable,
+        key=lambda record: (
+            _pool_record_in_cooldown(record, now=now),
+            _pool_priority(record),
+        ),
+    )
 
 
 def _codex_record(raw: dict) -> dict:
@@ -114,8 +172,12 @@ def _codex_record(raw: dict) -> dict:
 
     Hermes may nest credentials under ``providers/openai-codex`` or store a
     prioritized credential list under ``credential_pool/openai-codex``. The Codex
-    CLI keeps ``tokens`` at the top level. Return a normalized dict carrying
-    ``tokens`` in all cases.
+    CLI keeps ``tokens`` at the top level. Only the pooled layout is projected
+    onto a record carrying ``tokens``; the other two are returned unchanged,
+    since they may legitimately omit ``refresh_token``/``account_id`` or carry a
+    top-level API key instead of ``tokens``.
+
+    Raise RuntimeError when a non-empty pool yields no selectable record.
     """
     providers = raw.get("providers")
     if isinstance(providers, dict) and isinstance(
@@ -125,22 +187,30 @@ def _codex_record(raw: dict) -> dict:
 
     pool = raw.get("credential_pool")
     pool_records = pool.get(_HERMES_CODEX_PROVIDER) if isinstance(pool, dict) else None
-    if isinstance(pool_records, list):
-        usable_records = [
-            record for record in pool_records if _pool_record_usable(record)
-        ]
-        if usable_records:
-            record = sorted(
-                usable_records,
-                key=lambda item: item.get("priority", 100),
-            )[0]
-            return {
-                "tokens": {
-                    "access_token": record.get("access_token"),
-                    "refresh_token": record.get("refresh_token"),
-                    "account_id": record.get("account_id"),
-                }
+    if (
+        isinstance(pool, dict)
+        and _HERMES_CODEX_PROVIDER in pool
+        and not isinstance(pool_records, list)
+    ):
+        raise RuntimeError("Codex credential pool is not a list")
+    if isinstance(pool_records, list) and pool_records:
+        # A non-empty pool that yields nothing is a selection failure, not an
+        # absent pool: falling through would report that the auth store holds
+        # no usable token while the tokens sit right there, excluded by rule.
+        # Keep identifiers out of the message -- it may reach shared logs.
+        record = _select_pool_record(pool_records)
+        if record is None:
+            raise RuntimeError(
+                "Codex credential pool selection found no usable credential "
+                f"among {len(pool_records)} records"
+            )
+        return {
+            "tokens": {
+                "access_token": record.get("access_token"),
+                "refresh_token": record.get("refresh_token"),
+                "account_id": record.get("account_id"),
             }
+        }
 
     return raw
 

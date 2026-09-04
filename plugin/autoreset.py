@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -36,6 +37,43 @@ _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
+def _write_stderr(message: str) -> None:
+    """Write a best-effort plugin diagnostic without changing control flow."""
+    try:
+        print(f"[{PLUGIN_ID}] {message}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 - diagnostics must not alter the outcome
+        pass
+
+
+def _exception_text(exc: BaseException) -> str:
+    """Render an exception as one safe diagnostic line."""
+    try:
+        text = str(exc)
+    except BaseException:  # noqa: BLE001 - diagnostics must remain best-effort
+        text = type(exc).__name__
+    return " ".join(text.splitlines()) or type(exc).__name__
+
+
+def _warn_retrieval_failure(step: str, exc: Exception) -> str:
+    """Write one stderr line for a retrieval the coordinator is about to swallow.
+
+    stderr is the plugin's documented diagnostic channel (the footer path
+    already uses it) and is known to reach deployment logs, whereas a module
+    logger only lands if the host configured one. Called at the top of the
+    ``except`` block, before the lock or the cooldown, so lock contention
+    cannot suppress the line.
+
+    The write is guarded: emitting the diagnostic must never change the status,
+    the cooldown, or the persisted state. An unwritable stderr (a closed or
+    broken stream) would otherwise escape into the coordinator's outer
+    catch-all, turning a ``transient`` result into ``error`` and skipping the
+    cooldown write that throttles the retry.
+    """
+    error = _exception_text(exc)
+    _write_stderr(f"auto reset {step} failed: {error}")
+    return error
+
+
 @dataclass(frozen=True)
 class AutoResetConfig:
     """Effective auto-reset settings, including fail-closed validation state."""
@@ -60,7 +98,17 @@ def _invalid(error: str) -> AutoResetConfig:
     return AutoResetConfig(enabled=False, threshold=0, valid=False, error=error)
 
 
-def _plugin_autoreset(config: dict) -> dict:
+def _warn_invalid_zero_threshold(error: str) -> None:
+    """Warn that explicit threshold zero cannot recover a frozen credential."""
+    _write_stderr(
+        f"auto reset config warning: {error}; threshold accepts 1..99. "
+        "Use /usage reset when Hermes has already frozen the Codex credential."
+    )
+
+
+def _plugin_autoreset(config: object) -> dict:
+    if not isinstance(config, dict):
+        raise ValueError("config must be a mapping")
     plugins = config.get("plugins")
     if plugins is None:
         return {}
@@ -103,10 +151,10 @@ def _parse_env_threshold(value: object) -> int:
         raise ValueError(f"{ENV_THRESHOLD} must be an integer string")
     normalized = value.strip()
     if not normalized.isdecimal():
-        raise ValueError(f"{ENV_THRESHOLD} must be an integer from 0 to 99")
+        raise ValueError(f"{ENV_THRESHOLD} must be an integer from 1 to 99")
     threshold = int(normalized)
-    if threshold > 99:
-        raise ValueError(f"{ENV_THRESHOLD} must be an integer from 0 to 99")
+    if not 1 <= threshold <= 99:
+        raise ValueError(f"{ENV_THRESHOLD} must be an integer from 1 to 99")
     return threshold
 
 
@@ -118,14 +166,14 @@ def _parse_plugin_boolean(value: object) -> bool:
 
 def _parse_plugin_threshold(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("plugin auto_reset.threshold must be an integer from 0 to 99")
-    if not 0 <= value <= 99:
-        raise ValueError("plugin auto_reset.threshold must be an integer from 0 to 99")
+        raise ValueError("plugin auto_reset.threshold must be an integer from 1 to 99")
+    if not 1 <= value <= 99:
+        raise ValueError("plugin auto_reset.threshold must be an integer from 1 to 99")
     return value
 
 
 def load_autoreset_config(
-    *, env: Mapping[str, str] | None = None, config: dict | None = None
+    *, env: Mapping[str, str] | None = None, config: object | None = None
 ) -> AutoResetConfig:
     """Resolve env overrides, canonical plugin config, then safe defaults.
 
@@ -134,9 +182,13 @@ def load_autoreset_config(
     """
     source_env: Mapping[str, str] = os.environ if env is None else env
     source_config = _load_hermes_config() if config is None else config
+    plugin: dict = {}
 
     try:
-        plugin = _plugin_autoreset(source_config)
+        # A fully specified environment override must not be invalidated by a
+        # malformed lower-precedence plugin entry that will not be consulted.
+        if ENV_ENABLED not in source_env or ENV_THRESHOLD not in source_env:
+            plugin = _plugin_autoreset(source_config)
 
         if ENV_ENABLED in source_env:
             enabled = _parse_env_boolean(source_env[ENV_ENABLED])
@@ -145,14 +197,37 @@ def load_autoreset_config(
         else:
             enabled = False
 
+        threshold_explicit = ENV_THRESHOLD in source_env or "threshold" in plugin
         if ENV_THRESHOLD in source_env:
             threshold = _parse_env_threshold(source_env[ENV_THRESHOLD])
         elif "threshold" in plugin:
             threshold = _parse_plugin_threshold(plugin["threshold"])
         else:
             threshold = 0
+        if enabled and not threshold_explicit:
+            raise ValueError(
+                "plugin auto_reset.threshold must be explicitly configured "
+                "as an integer from 1 to 99 when auto reset is enabled"
+            )
     except (TypeError, ValueError) as exc:
-        return _invalid(str(exc))
+        error = str(exc)
+        if ENV_THRESHOLD in source_env:
+            raw_threshold = source_env.get(ENV_THRESHOLD)
+            explicit_zero = (
+                isinstance(raw_threshold, str)
+                and raw_threshold.strip().isdecimal()
+                and int(raw_threshold.strip()) == 0
+            )
+        else:
+            raw_threshold = plugin.get("threshold")
+            explicit_zero = (
+                isinstance(raw_threshold, int)
+                and not isinstance(raw_threshold, bool)
+                and raw_threshold == 0
+            )
+        if explicit_zero:
+            _warn_invalid_zero_threshold(error)
+        return _invalid(error)
 
     return AutoResetConfig(enabled=enabled, threshold=threshold)
 
@@ -832,12 +907,13 @@ def maybe_autoreset(
             try:
                 initial_usage = fetch_usage()
             except Exception as exc:
+                error = _warn_retrieval_failure("initial usage fetch", exc)
                 make_lock = lock_factory or (
                     lambda: acquire_autoreset_lock(home=state_store.home, now=now)
                 )
                 with make_lock() as acquired:
                     if not acquired:
-                        return AutoResetResult("busy", message=str(exc))
+                        return AutoResetResult("busy", message=error)
                     state = state_store.load()
                     _set_cooldown(
                         state,
@@ -847,7 +923,7 @@ def maybe_autoreset(
                         clear_pending=False,
                     )
                     state_store.write(state)
-                return AutoResetResult("transient", message=str(exc))
+                return AutoResetResult("transient", message=error)
         if not isinstance(initial_usage, dict):
             return AutoResetResult("ineligible")
         before_remaining = weekly_remaining(initial_usage)
@@ -907,6 +983,7 @@ def maybe_autoreset(
             try:
                 live_usage = fetch_usage()
             except Exception as exc:
+                error = _warn_retrieval_failure("in-lock usage recheck", exc)
                 _set_cooldown(
                     state,
                     now=now,
@@ -915,7 +992,7 @@ def maybe_autoreset(
                     clear_pending=False,
                 )
                 state_store.write(state)
-                return AutoResetResult("transient", message=str(exc))
+                return AutoResetResult("transient", message=error)
             if not isinstance(live_usage, dict):
                 return AutoResetResult("ineligible")
             live_remaining = weekly_remaining(live_usage)
@@ -935,6 +1012,7 @@ def maybe_autoreset(
                 try:
                     details = list_credits()
                 except Exception as exc:
+                    error = _warn_retrieval_failure("reset credit listing", exc)
                     _set_cooldown(
                         state,
                         now=now,
@@ -943,7 +1021,7 @@ def maybe_autoreset(
                         clear_pending=False,
                     )
                     state_store.write(state)
-                    return AutoResetResult("transient", message=str(exc))
+                    return AutoResetResult("transient", message=error)
                 selected = (
                     select_earliest_available_credit(details)
                     if isinstance(details, dict)

@@ -26,19 +26,72 @@ def _plugin_config(*, enabled=True, threshold=10):
     }
 
 
-def test_config_defaults_disabled_threshold_zero():
+def test_config_defaults_disabled_threshold_zero_without_warning(capsys):
     assert autoreset.load_autoreset_config(
         env={}, config={}
     ) == autoreset.AutoResetConfig(
         enabled=False,
         threshold=0,
     )
+    assert capsys.readouterr().err == ""
 
 
 def test_plugin_entry_enables_auto_reset():
     assert autoreset.load_autoreset_config(
         env={}, config=_plugin_config(enabled=True, threshold=10)
     ) == autoreset.AutoResetConfig(enabled=True, threshold=10)
+
+
+def test_enabled_config_requires_an_explicit_threshold():
+    config = _plugin_config(enabled=True, threshold=10)
+    del config["plugins"]["entries"]["hermes-usage-hook"]["auto_reset"]["threshold"]
+
+    result = autoreset.load_autoreset_config(env={}, config=config)
+
+    assert result.valid is False
+    assert result.enabled is False
+    assert "explicitly configured" in (result.error or "")
+
+
+def test_malformed_plugin_tree_fails_closed_without_secondary_exception():
+    result = autoreset.load_autoreset_config(env={}, config={"plugins": []})
+
+    assert result.valid is False
+    assert result.enabled is False
+    assert result.error == "plugins must be a mapping"
+
+
+def test_non_mapping_config_fails_closed():
+    result = autoreset.load_autoreset_config(env={}, config=[])
+
+    assert result.valid is False
+    assert result.enabled is False
+    assert result.error == "config must be a mapping"
+
+
+def test_complete_env_override_ignores_malformed_lower_precedence_config():
+    result = autoreset.load_autoreset_config(
+        env={
+            autoreset.ENV_ENABLED: "true",
+            autoreset.ENV_THRESHOLD: "10",
+        },
+        config={"plugins": []},
+    )
+
+    assert result == autoreset.AutoResetConfig(enabled=True, threshold=10)
+
+
+def test_invalid_complete_env_override_reports_env_error_before_bad_config():
+    result = autoreset.load_autoreset_config(
+        env={
+            autoreset.ENV_ENABLED: "invalid",
+            autoreset.ENV_THRESHOLD: "10",
+        },
+        config={"plugins": []},
+    )
+
+    assert result.valid is False
+    assert result.error == f"{autoreset.ENV_ENABLED} has an invalid boolean value"
 
 
 def test_env_false_overrides_plugin_true():
@@ -68,13 +121,64 @@ def test_env_threshold_overrides_plugin_threshold():
     assert result.valid is True
 
 
-@pytest.mark.parametrize("value", [0, 99])
-def test_threshold_accepts_zero_and_ninety_nine(value):
+@pytest.mark.parametrize("value", [1, 99])
+def test_threshold_accepts_one_and_ninety_nine(value):
     result = autoreset.load_autoreset_config(
         env={}, config=_plugin_config(threshold=value)
     )
     assert result.threshold == value
     assert result.valid is True
+
+
+def _assert_zero_threshold_warning(stderr):
+    lines = stderr.strip().splitlines()
+    assert len(lines) == 1
+    assert "[hermes-usage-hook]" in lines[0]
+    assert "threshold" in lines[0]
+    assert "1..99" in lines[0]
+    assert "/usage reset" in lines[0]
+
+
+def test_explicit_plugin_threshold_zero_fails_closed_with_warning(capsys):
+    result = autoreset.load_autoreset_config(
+        env={}, config=_plugin_config(enabled=True, threshold=0)
+    )
+
+    assert result.valid is False
+    assert result.enabled is False
+    _assert_zero_threshold_warning(capsys.readouterr().err)
+
+
+def test_explicit_env_threshold_zero_fails_closed_with_warning(capsys):
+    result = autoreset.load_autoreset_config(
+        env={autoreset.ENV_THRESHOLD: "0"},
+        config=_plugin_config(enabled=True, threshold=10),
+    )
+
+    assert result.valid is False
+    assert result.enabled is False
+    _assert_zero_threshold_warning(capsys.readouterr().err)
+
+
+def test_whitespace_padded_env_threshold_zero_warns(capsys):
+    result = autoreset.load_autoreset_config(
+        env={autoreset.ENV_THRESHOLD: " 0 "},
+        config=_plugin_config(enabled=True, threshold=10),
+    )
+
+    assert result.valid is False
+    assert result.enabled is False
+    _assert_zero_threshold_warning(capsys.readouterr().err)
+
+
+def test_boolean_plugin_threshold_does_not_emit_zero_warning(capsys):
+    result = autoreset.load_autoreset_config(
+        env={}, config=_plugin_config(enabled=True, threshold=False)
+    )
+
+    assert result.valid is False
+    assert result.enabled is False
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("value", ["", "x", "-1", "100", True, 1.5])
@@ -579,12 +683,15 @@ class _Fetcher:
 
 
 class _Lister:
-    def __init__(self, payload):
+    def __init__(self, payload=None, error=None):
         self.payload = payload
+        self.error = error
         self.calls = 0
 
     def __call__(self):
         self.calls += 1
+        if self.error is not None:
+            raise self.error
         return self.payload
 
 
@@ -1081,6 +1188,113 @@ def test_initial_usage_fetch_failure_sets_one_minute_cooldown_and_preserves_stat
     assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
     assert state["cooldown_reason"] == "transient"
     assert store.pop_notice("sess-earlier", now=1_001.0) == "earlier notice"
+
+
+def test_maybe_autoreset_logs_transient_usage_fetch_failure(tmp_path, capsys):
+    # Supplying ``usage`` skips the pre-lock fetch, so this covers the in-lock
+    # recheck. The coordinator swallows retrieval failures into a transient
+    # cooldown; without a diagnostic line that path stays completely silent,
+    # which is what kept this defect invisible.
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(ConnectionError("usage endpoint unreachable")),
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "transient"
+    state = store.load()
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
+    assert state["cooldown_reason"] == "transient"
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 1
+    assert "[hermes-usage-hook]" in lines[0]
+    assert "usage" in lines[0]
+    assert "usage endpoint unreachable" in lines[0]
+
+
+def test_maybe_autoreset_flattens_multiline_exception_text(tmp_path, capsys):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(ConnectionError("first line\nsecond line")),
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "transient"
+    assert result.message == "first line second line"
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1
+
+
+def test_maybe_autoreset_logs_transient_credit_listing_failure(tmp_path, capsys):
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=_eligible_usage(remaining=5),
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(_eligible_usage(remaining=5)),
+        credit_lister=_Lister(error=ConnectionError("credits endpoint unreachable")),
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(True),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "transient"
+    state = store.load()
+    assert state["cooldown_until"] == 1_000.0 + autoreset.COOLDOWN_RETRY_SECONDS
+    assert state["cooldown_reason"] == "transient"
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 1
+    assert "[hermes-usage-hook]" in lines[0]
+    assert "credit" in lines[0]
+    assert "credits endpoint unreachable" in lines[0]
+
+
+def test_maybe_autoreset_logs_usage_fetch_failure_when_lock_busy(tmp_path, capsys):
+    # The initial fetch returns busy instead of transient when another process
+    # holds the lock. The retrieval failed either way, so the line must still
+    # be written -- suppressing it exactly on lock contention would restore the
+    # blind spot this diagnostic exists to remove.
+    store = autoreset.AutoResetStateStore(home=tmp_path, clock=lambda: 1_000.0)
+
+    result = autoreset.maybe_autoreset(
+        model="gpt-5-codex",
+        usage=None,
+        config=_enabled_config(threshold=10),
+        store=store,
+        usage_fetcher=_Fetcher(ConnectionError("usage endpoint unreachable")),
+        credit_lister=_never,
+        consumer=_never,
+        uuid_factory=_never,
+        lock_factory=_LockFactory(False),
+        clock=lambda: 1_000.0,
+    )
+
+    assert result.status == "busy"
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 1
+    assert "[hermes-usage-hook]" in lines[0]
+    assert "usage" in lines[0]
+    assert "usage endpoint unreachable" in lines[0]
 
 
 def _http_status_error(status_code):
