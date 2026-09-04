@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.2](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.4.1...v0.4.2) (2026-09-04)
+
+
+### Features
+
+* Codex auto-reset success history + /usagehook command ([#16](https://github.com/chenwei791129/hermes-usage-hook/issues/16)) ([3375fa4](https://github.com/chenwei791129/hermes-usage-hook/commit/3375fa4e56d0cee51121a432eead27ca5a08ff38))
+
+
+### Bug Fixes
+
+* harden Codex credential and threshold handling ([2f02050](https://github.com/chenwei791129/hermes-usage-hook/commit/2f020506ed27806106eda2a505502a9bbb892057))
+* unify plugin Hermes home on the profile-safe resolver ([5e3e1cb](https://github.com/chenwei791129/hermes-usage-hook/commit/5e3e1cbe86645453a4f7cce35abec8148ff89d2d))
+
+
+### Miscellaneous Chores
+
+* **release:** prepare 0.4.2 ([cef26fb](https://github.com/chenwei791129/hermes-usage-hook/commit/cef26fb021a5331b2959f590cedf77b2380e7f86))
+
 ## [0.4.1](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.4.0...v0.4.1) (2026-07-31)
 
 
