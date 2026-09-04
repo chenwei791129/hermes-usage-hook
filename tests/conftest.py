@@ -31,7 +31,9 @@ def fake_hermes_constants(monkeypatch):
 
     def _install(home):
         module = types.ModuleType("hermes_constants")
-        module.get_hermes_home = lambda: home
+        # Populate through __dict__: a synthetic module has no declared
+        # attributes, so a plain assignment is unresolvable to a type checker.
+        module.__dict__["get_hermes_home"] = lambda: home
         monkeypatch.setitem(sys.modules, "hermes_constants", module)
         return home
 
