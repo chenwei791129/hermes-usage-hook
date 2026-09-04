@@ -725,7 +725,8 @@ def test_after_install_documents_autoreset_optin():
         "irreversible",
         "standing authorization",
         "weekly-remaining",
-        "0..99",
+        "1..99",
+        "/usage reset",
         "/usagehook history",
     ]
     for needle in required:
@@ -740,7 +741,8 @@ def test_agents_doc_documents_autoreset_internals():
         "env → plugin config → 預設值",
         "plugins.entries.<plugin_id>",
         "load_config()",
-        "0..99",
+        "1..99",
+        "/usage reset",
         "weekly remaining",
         "最早到期",
         "冪等",
@@ -994,6 +996,188 @@ def test_load_auth_uses_exhausted_pool_record_after_cooldown(monkeypatch, tmp_pa
     record = codex_usage._load_auth()
 
     assert record["tokens"]["access_token"] == "recovered-access-tok"
+
+
+def test_load_auth_uses_highest_priority_record_when_all_exhausted(
+    monkeypatch, tmp_path
+):
+    # Every pooled credential is rate-limited: that is exactly when auto reset
+    # must run, so resolution has to yield the top-priority record instead of
+    # failing. The usage and reset-credit endpoints are not gated by the
+    # completions quota that produced ``exhausted``.
+    auth = _pool_auth(
+        [
+            {
+                "id": "secondary",
+                "priority": 20,
+                "access_token": "secondary-access-tok",
+                "last_status": "exhausted",
+                "last_error_reset_at": _FUTURE_EPOCH,
+            },
+            {
+                "id": "primary",
+                "priority": 10,
+                "access_token": "primary-access-tok",
+                "last_status": "exhausted",
+                "last_error_reset_at": _FUTURE_EPOCH,
+            },
+        ]
+    )
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "primary-access-tok"
+
+
+def test_load_auth_prefers_exhausted_over_dead_record(monkeypatch, tmp_path):
+    # ``dead`` is a hard exclusion (the token is revoked server-side), while a
+    # cooldown only demotes: with nothing else in the pool, the exhausted
+    # record still wins.
+    auth = _pool_auth(
+        [
+            {
+                "id": "primary",
+                "priority": 10,
+                "access_token": "dead-access-tok",
+                "last_status": "dead",
+            },
+            {
+                "id": "secondary",
+                "priority": 20,
+                "access_token": "exhausted-access-tok",
+                "last_status": "exhausted",
+                "last_error_reset_at": _FUTURE_EPOCH,
+            },
+        ]
+    )
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "exhausted-access-tok"
+
+
+def test_load_auth_raises_when_pool_has_only_dead_records(monkeypatch, tmp_path):
+    # A non-empty pool that yields no candidate must name credential-pool
+    # selection as the cause instead of falling through to the flat layout and
+    # claiming the auth store holds no token. The message must stay free of
+    # every identifying field on the records, not just the tokens.
+    records = [
+        {
+            "id": "primary",
+            "priority": 10,
+            "access_token": "dead-access-tok-1",
+            "refresh_token": "dead-refresh-tok-1",
+            "account_id": "account-dead-1",
+            "last_status": "dead",
+        },
+        {
+            "id": "secondary",
+            "priority": 20,
+            "access_token": "dead-access-tok-2",
+            "refresh_token": "dead-refresh-tok-2",
+            "account_id": "account-dead-2",
+            "last_status": "dead",
+        },
+    ]
+    auth = _pool_auth(records)
+    auth["tokens"] = {"access_token": "stale-top-level-tok"}
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        codex_usage._load_auth()
+
+    message = str(excinfo.value)
+    assert "credential pool" in message.lower()
+    assert "2" in message
+    for record in records:
+        for field in ("access_token", "refresh_token", "id", "account_id"):
+            # str() only satisfies the type checker: the pool records mix
+            # str and int values, while these four fields are always strings.
+            assert str(record[field]) not in message
+
+
+def test_load_auth_falls_back_to_flat_layout_for_empty_pool_list(monkeypatch, tmp_path):
+    # An empty pool means the deployment holds no pooled Codex credential at
+    # all, which is not a selection failure: the flat fallthrough must survive
+    # the explicit-failure rule for non-empty pools.
+    auth = _pool_auth([])
+    auth["tokens"] = {"access_token": "flat-access-tok"}
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "flat-access-tok"
+
+
+@pytest.mark.parametrize("priority", [float("nan"), float("inf"), float("-inf")])
+def test_pool_selection_treats_non_finite_priority_as_default(priority):
+    record = codex_usage._select_pool_record(
+        [
+            {"priority": priority, "access_token": "unranked-access-tok"},
+            {"priority": 20, "access_token": "ranked-access-tok"},
+        ]
+    )
+
+    assert record is not None
+    assert record["access_token"] == "ranked-access-tok"
+
+
+@pytest.mark.parametrize("access_token", [123, True, [], {}, "   "])
+def test_pool_selection_rejects_non_string_or_blank_token(access_token):
+    record = codex_usage._select_pool_record(
+        [
+            {"priority": 1, "access_token": access_token},
+            {"priority": 2, "access_token": "valid-access-tok"},
+        ]
+    )
+
+    assert record is not None
+    assert record["access_token"] == "valid-access-tok"
+
+
+def test_load_auth_rejects_non_list_pool_layout(monkeypatch, tmp_path):
+    auth = _pool_auth([])
+    auth["credential_pool"]["openai-codex"] = {"access_token": "mis-shaped-access-tok"}
+    auth["tokens"] = {"access_token": "stale-top-level-tok"}
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="credential pool is not a list"):
+        codex_usage._load_auth()
+
+
+def test_load_auth_treats_non_numeric_priority_as_default(monkeypatch, tmp_path):
+    # A ``null`` priority must normalize to the default (100) before it is used
+    # as a sort key: comparing the raw value against an int raises TypeError,
+    # which escapes _load_auth() into the same transient loop this change fixes.
+    auth = _pool_auth(
+        [
+            {
+                "id": "unranked",
+                "priority": None,
+                "access_token": "unranked-access-tok",
+                "last_status": "ok",
+            },
+            {
+                "id": "ranked",
+                "priority": 20,
+                "access_token": "ranked-access-tok",
+                "last_status": "ok",
+            },
+        ]
+    )
+    (tmp_path / "auth.json").write_text(json.dumps(auth))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    record = codex_usage._load_auth()
+
+    assert record["tokens"]["access_token"] == "ranked-access-tok"
 
 
 def test_load_auth_reads_flat_codex_cli_layout(monkeypatch, tmp_path):
