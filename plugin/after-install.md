@@ -51,10 +51,10 @@ explicit standing authorization for autonomous reset-credit use.
 
 ```bash
 hermes config set plugins.entries.hermes-usage-hook.auto_reset.enabled true
-hermes config set plugins.entries.hermes-usage-hook.auto_reset.threshold 0
+hermes config set plugins.entries.hermes-usage-hook.auto_reset.threshold 1
 ```
 
-`threshold` uses weekly-remaining semantics and accepts `0..99`. Once auto reset
+`threshold` uses weekly-remaining semantics and accepts explicit values `1..99`. Explicit `0` fails closed and emits a warning; if Hermes has already frozen the Codex credential as `exhausted`, use `/usage reset` to recover it manually. Once auto reset
 is on, `/usagehook history [N]` reports past resets from any chat platform (`N`
 is 1–100, newest 5 by default).
 

@@ -41,7 +41,7 @@ Auto-reset documentation SHALL be split by audience across three files, and no s
 
 - `README.md` SHALL point the reader to `plugin/after-install.md` for setup notes and SHALL state that Codex auto reset is optional. It SHALL NOT be required to carry the auto-reset configuration reference.
 - `plugin/after-install.md` SHALL carry the operator-facing decision content. Its required contents are specified by the post-install notice requirement and SHALL NOT be restated here.
-- `AGENTS.md` SHALL carry the development and operational detail: the `CODEX_ENABLE_AUTORESET` and `CODEX_AUTORESET_THRESHOLD` override names, the env then plugin config then defaults precedence, the `0..99` threshold range with weekly-remaining semantics, that the plugin reads its own `auto_reset` schema from the same plugin entry through the host `load_config()` on every hook call, that OAuth credentials do not belong in plugin config, earliest-expiry idempotent credit selection, the notices queue file and the lock protecting it, the single coordinator-locked atomic write that persists a terminal transition, the five-minute post-success suppression window, and the rendered audit footer line.
+- `AGENTS.md` SHALL carry the development and operational detail: the `CODEX_ENABLE_AUTORESET` and `CODEX_AUTORESET_THRESHOLD` override names, the env then plugin config then defaults precedence, the explicit `1..99` threshold range with weekly-remaining semantics, that explicitly configuring threshold 0 fails closed and emits a warning directing operators to `/usage reset` for an already-frozen credential, that the plugin reads its own `auto_reset` schema from the same plugin entry through the host `load_config()` on every hook call, that OAuth credentials do not belong in plugin config, earliest-expiry idempotent credit selection, the notices queue file and the lock protecting it, the single coordinator-locked atomic write that persists a terminal transition, the five-minute post-success suppression window, and the rendered audit footer line.
 
 The documentation SHALL NOT place runtime values in `plugin.yaml` and SHALL NOT instruct users to store OAuth tokens in plugin settings.
 
@@ -68,7 +68,8 @@ The documentation SHALL NOT place runtime values in `plugin.yaml` and SHALL NOT 
 #### Scenario: AGENTS.md documents the auto-reset configuration and operational contract
 
 - **WHEN** `AGENTS.md` is read after this change
-- **THEN** it names both environment override variables, states the env then plugin config then defaults precedence, states the `0..99` range with weekly-remaining semantics, states that the plugin reads its own config through the host `load_config()`, states that OAuth credentials do not belong in plugin config, describes earliest-expiry idempotent credit selection, names the notices queue file and its lock, describes the single coordinator-locked atomic write and the five-minute suppression window, and shows the audit footer line
+- **THEN** it names both environment override variables, states the env then plugin config then defaults precedence, states the explicit `1..99` range with weekly-remaining semantics, states that explicit zero fails closed and directs an operator to `/usage reset`, states that the plugin reads its own config through the host `load_config()`, states that OAuth credentials do not belong in plugin config, describes earliest-expiry idempotent credit selection, names the notices queue file and its lock, describes the single coordinator-locked atomic write and the five-minute suppression window, and shows the audit footer line
+
 
 ---
 ### Requirement: Package the plugin under a dedicated subdirectory

@@ -76,6 +76,8 @@ uv run plugin/providers/codex_usage.py
 
 **憑證解析。** Codex 走 OAuth，hook 只**讀** access token，不 refresh、不寫回：先看 Hermes 的 `$HERMES_HOME/auth.json`（同時支援 `providers.openai-codex` 與 `credential_pool.openai-codex` 兩種 layout），standalone 則讀 Codex CLI 的 `~/.codex/auth.json`（或 `$CODEX_HOME/auth.json`）。查的是 Codex 工具在用的 ChatGPT 內部非公開 backend API，隨時可能變。Hermes 底下由 Hermes 保持 token 新鮮；token 過期就是 usage call 失敗、footer 被省略。Codex 的 5 小時視窗是**帳號層級**的 rolling quota，不是單一對話的用量，與 Codex CLI 顯示的數字相同。
 
+`credential_pool` layout 的挑選是**兩層**的：`last_status` 為 `dead`、或缺少非空 `access_token` 的記錄硬性排除（token 已被伺服器端撤銷，降級使用沒有意義）；`last_status` 為 `exhausted` 且 `last_error_reset_at` 仍在未來的記錄只是**降級**，不排除。挑選先在未冷卻的候選裡依 `priority` 昇冪取第一筆，該層為空才在冷卻中的候選裡以同樣規則取。`priority` 缺值、`null`、布林或任何非數值一律正規化為 100 才當排序鍵。`exhausted` 不排除是因為它描述的是 completions endpoint 的帳號配額，而本 plugin 只讀 usage 與 reset-credit 兩個不受該配額限制的端點——把它當排除條件會讓 auto reset 永遠無法觸發，因為 weekly 耗盡正是它唯一的觸發條件。`openai-codex` 的 pool 清單非空卻選不出任何候選時，解析以點名憑證池挑選失敗與記錄筆數的 `RuntimeError` 結束，**不**退回扁平 layout：token 就在檔案裡、只是被規則排除，退回會回報一個與事實相反的「檔案裡沒有可用 token」。清單不存在或為空才維持扁平 layout fallthrough。
+
 MiniMax 是純 API key（沒有 OAuth）：`MINIMAX_API_KEY` 環境變數（空值視為未設）→ `$HERMES_HOME/.env` 裡的 `MINIMAX_API_KEY=<value>` 行（會剝掉外層引號；`HERMES_HOME` 未設時預設 `~/.hermes/.env`）。都拿不到就跳過 MiniMax。MiniMax 沒有 plan tier，所以 `| plan …` 段會省略。
 
 **Codex auto reset。** 預設關閉。啟用 `plugins.entries.hermes-usage-hook.auto_reset.enabled` 等於明確授權 plugin 自主消耗 reset credit，而消耗是不可逆的。設定從 plugin entry 讀：
@@ -86,10 +88,10 @@ plugins:
     hermes-usage-hook:
       auto_reset:
         enabled: true
-        threshold: 0
+        threshold: 1
 ```
 
-消耗一張 credit 會同時 reset 帳號的 5h 與 weekly 兩個視窗，但**資格判定只看 weekly**：5h 用完不會觸發 auto reset。`threshold` 是 weekly remaining 語意，只接受 `0..99`，資格判定為 `weekly remaining <= threshold`。`100` 故意不合法——剛 reset 完的 weekly 視窗 remaining 是 100%，會立刻再次符合條件。環境變數 `CODEX_ENABLE_AUTORESET`、`CODEX_AUTORESET_THRESHOLD` 供 process-managed 部署覆寫，優先序是 env → plugin config → 預設值。plugin config 每次 hook 呼叫都經 Hermes `load_config()` 重讀，所以改 `config.yaml` 不必重裝 plugin；改 process environment 要重啟 / reload Gateway。OAuth 憑證不屬於 plugin config。
+消耗一張 credit 會同時 reset 帳號的 5h 與 weekly 兩個視窗，但**資格判定只看 weekly**：5h 用完不會觸發 auto reset；5h 資格判定由 Issue #21 處理，本次不改。`threshold` 是 weekly remaining 語意，只接受明確設定的 `1..99`，資格判定為 `weekly remaining <= threshold`。明確設定 `0` 會 fail closed 並輸出一行 warning；如果 Hermes 已將 Codex 憑證標為 `exhausted` 而凍結，使用內建 `/usage reset` 手動恢復。`100` 故意不合法——剛 reset 完的 weekly 視窗 remaining 是 100%，會立刻再次符合條件。環境變數 `CODEX_ENABLE_AUTORESET`、`CODEX_AUTORESET_THRESHOLD` 供 process-managed 部署覆寫，優先序是 env → plugin config → 預設值。plugin config 每次 hook 呼叫都經 Hermes `load_config()` 重讀，所以改 `config.yaml` 不必重裝 plugin；改 process environment 要重啟 / reload Gateway。OAuth 憑證不屬於 plugin config。
 
 Hermes 對 `plugins.entries.<plugin_id>` 的文件是 plugin LLM trust 設定（<https://hermes-agent.nousresearch.com/docs/developer-guide/plugin-llm-access#trust-gate>）。本 plugin 是從同一個 plugin entry 用 `load_config()` 讀自己的 `auto_reset.*` schema；Hermes 沒有為這些值提供通用的 plugin-config UI 或 schema。
 
