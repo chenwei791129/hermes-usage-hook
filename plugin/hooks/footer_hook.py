@@ -2,7 +2,9 @@
 
 Detects the provider from the reply's ``model`` (Codex or MiniMax) and appends
 that provider's usage — a ``5h`` line plus a ``weekly`` line when available; an
-unrecognized model leaves the reply unchanged.
+unrecognized model leaves the reply unchanged unless the opt-in
+``footer.show_model`` setting is enabled, in which case a ``Model <model>`` line
+renders above the usage lines and still renders alone without usage.
 
 Registers exactly two synchronous hooks plus one in-session slash command:
 
@@ -32,7 +34,7 @@ import logging
 import sys
 import unicodedata
 
-from .. import autoreset_audit
+from .. import autoreset_audit, footer_config
 from ..autoreset import AutoResetStateStore, maybe_autoreset
 from ..usage import format_summary, get_usage_for_model
 
@@ -219,13 +221,63 @@ def _pop_notice(session_id: str) -> str | None:
         return None
 
 
+def _model_line(model: object) -> str | None:
+    """Render ``Model <model>`` for a non-blank model name, else None."""
+    name = model.strip() if isinstance(model, str) else ""
+    return f"Model {name}" if name else None
+
+
+def _usage_lines(model: str | None, session_id: str) -> list[str]:
+    """Return the usage summary and any one-shot notice, or [] without usage."""
+    try:
+        usage = get_usage_for_model(model)
+    except Exception as exc:  # noqa: BLE001 - a model-only footer may remain
+        print(f"[hermes-usage-hook] skipped: {exc}", file=sys.stderr)
+        return []
+    if usage is None:
+        return []
+    notice = None
+    try:
+        reset_result = maybe_autoreset(
+            model=model,
+            usage=usage,
+            session_id=session_id,
+        )
+        if reset_result.after_usage is not None:
+            usage = reset_result.after_usage
+        # Skip the locked notice-store reads when auto reset never ran: these
+        # states persist no notice, so polling would only add filesystem I/O
+        # to every reply for deployments that never enabled the feature.
+        if reset_result.status not in _NO_NOTICE_STATUSES:
+            notice = _pop_notice(session_id)
+        if (
+            notice is None
+            and reset_result.status in {"reset", "already_redeemed"}
+            and not reset_result.notice_persisted
+        ):
+            notice = reset_result.message
+    except Exception as exc:  # noqa: BLE001 - preserve normal footer behavior
+        print(f"[hermes-usage-hook] auto reset skipped: {exc}", file=sys.stderr)
+    try:
+        lines = [format_summary(usage)]
+    except Exception as exc:  # noqa: BLE001 - a model-only footer may remain
+        print(f"[hermes-usage-hook] skipped: {exc}", file=sys.stderr)
+        return []
+    if notice:
+        lines.append(notice)
+    return lines
+
+
 def append_usage_footer(response_text: str, **kwargs) -> str | None:
     """Append usage, preserve silence markers, or return None for no change.
 
     Detects the provider from the current reply's ``model`` and fetches that
-    provider's usage, rendering its ``5h`` and ``weekly`` windows. Intentional
-    silence markers are returned unchanged to stop subsequent transform hooks;
-    an unrecognized model or fetch failure returns None.
+    provider's usage, rendering its ``5h`` and ``weekly`` windows. When the
+    opt-in ``footer.show_model`` setting is enabled, a ``Model <model>`` line
+    renders above the usage lines and still renders alone when no usage is
+    available. Intentional silence markers are returned unchanged to stop
+    subsequent transform hooks; with the model display disabled, an
+    unrecognized model or fetch failure returns None.
     """
     if not response_text:
         return None
@@ -236,36 +288,13 @@ def append_usage_footer(response_text: str, **kwargs) -> str | None:
         return response_text
     try:
         model = kwargs.get("model")
-        session_id = kwargs.get("session_id") or ""
-        usage = get_usage_for_model(model)
-        if usage is None:
-            return None
-        notice = None
-        try:
-            reset_result = maybe_autoreset(
-                model=model,
-                usage=usage,
-                session_id=session_id,
-            )
-            if reset_result.after_usage is not None:
-                usage = reset_result.after_usage
-            # Skip the locked notice-store reads when auto reset never ran: these
-            # states persist no notice, so polling would only add filesystem I/O
-            # to every reply for deployments that never enabled the feature.
-            if reset_result.status not in _NO_NOTICE_STATUSES:
-                notice = _pop_notice(session_id)
-            if (
-                notice is None
-                and reset_result.status in {"reset", "already_redeemed"}
-                and not reset_result.notice_persisted
-            ):
-                notice = reset_result.message
-        except Exception as exc:  # noqa: BLE001 - preserve normal footer behavior
-            print(f"[hermes-usage-hook] auto reset skipped: {exc}", file=sys.stderr)
-        footer = format_summary(usage)
-        if notice:
-            footer = f"{footer}\n{notice}"
+        model_line = _model_line(model) if footer_config.load_show_model() else None
+        lines = [model_line] if model_line else []
+        lines += _usage_lines(model, kwargs.get("session_id") or "")
     except Exception as exc:  # noqa: BLE001 - never break the reply
         print(f"[hermes-usage-hook] skipped: {exc}", file=sys.stderr)
         return None
+    if not lines:
+        return None
+    footer = "\n".join(lines)
     return f"{response_text}\n\n───\n{footer}"

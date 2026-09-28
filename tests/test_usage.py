@@ -13,6 +13,8 @@ import inspect
 import json
 import logging
 import os
+import sys
+import types
 from pathlib import Path
 
 import httpx
@@ -703,6 +705,203 @@ def test_autoreset_failure_keeps_original_reply_and_normal_footer(monkeypatch):
     )
 
 
+# --- Footer model display -------------------------------------------------------
+
+_MODEL_DISPLAY_CODEX_USAGE = {
+    "provider": "Codex",
+    "plan_type": "pro",
+    "windows": {
+        "5h": {"used_percent": 42, "remaining_percent": 58, "reset_in_min": 137},
+        "weekly": {"used_percent": 10, "remaining_percent": 90, "reset_in_min": 8880},
+    },
+}
+_MODEL_DISPLAY_5H_LINE = "Codex 5h | used 42%, left 58% (resets in 2h17m) | plan pro"
+_MODEL_DISPLAY_WEEKLY_LINE = "Codex weekly | used 10%, left 90% (resets in 6d4h)"
+
+
+def _set_show_model(monkeypatch, enabled):
+    monkeypatch.setattr(footer_hook.footer_config, "load_show_model", lambda: enabled)
+
+
+def _disable_autoreset(monkeypatch):
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("disabled"),
+    )
+
+
+def _stub_codex_usage(monkeypatch):
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _MODEL_DISPLAY_CODEX_USAGE
+    )
+    _disable_autoreset(monkeypatch)
+
+
+def _fail_autoreset(**_kwargs):
+    pytest.fail("a model-only footer must not run the auto-reset coordinator")
+
+
+def test_enabled_model_display_renders_model_line_above_codex_usage(monkeypatch):
+    _set_show_model(monkeypatch, True)
+    _stub_codex_usage(monkeypatch)
+
+    result = footer_hook.append_usage_footer("Done.", model="gpt-5.5-codex")
+
+    assert result == "\n".join(
+        [
+            "Done.",
+            "",
+            "───",
+            "Model gpt-5.5-codex",
+            _MODEL_DISPLAY_5H_LINE,
+            _MODEL_DISPLAY_WEEKLY_LINE,
+        ]
+    )
+
+
+def test_enabled_model_display_orders_model_usage_then_notice(monkeypatch):
+    notice = "Codex auto reset | weekly 0% → 100% | reset credits 3 → 2"
+    _set_show_model(monkeypatch, True)
+    monkeypatch.setattr(
+        footer_hook, "get_usage_for_model", lambda _model: _MODEL_DISPLAY_CODEX_USAGE
+    )
+    monkeypatch.setattr(
+        footer_hook,
+        "maybe_autoreset",
+        lambda **_kwargs: autoreset.AutoResetResult("reset", message=notice),
+    )
+
+    result = footer_hook.append_usage_footer(
+        "Done.", model="gpt-5.5-codex", session_id=""
+    )
+
+    assert result == "\n".join(
+        [
+            "Done.",
+            "",
+            "───",
+            "Model gpt-5.5-codex",
+            _MODEL_DISPLAY_5H_LINE,
+            _MODEL_DISPLAY_WEEKLY_LINE,
+            notice,
+        ]
+    )
+
+
+def test_config_load_failure_keeps_usage_footer_with_one_warning(monkeypatch, capsys):
+    def exploding_load_config():
+        raise RuntimeError("config.yaml unreadable")
+
+    module = types.ModuleType("hermes_cli.config")
+    module.__dict__["load_config"] = exploding_load_config
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", module)
+    _stub_codex_usage(monkeypatch)
+
+    result = footer_hook.append_usage_footer("Done.", model="gpt-5.5-codex")
+
+    assert result == "\n".join(
+        ["Done.", "", "───", _MODEL_DISPLAY_5H_LINE, _MODEL_DISPLAY_WEEKLY_LINE]
+    )
+    warnings = [line for line in capsys.readouterr().err.splitlines() if line]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("[hermes-usage-hook]")
+
+
+def test_disabled_model_display_leaves_footer_unchanged(monkeypatch):
+    _set_show_model(monkeypatch, False)
+    _stub_codex_usage(monkeypatch)
+
+    result = footer_hook.append_usage_footer("Done.", model="gpt-5.5-codex")
+
+    assert result == "\n".join(
+        ["Done.", "", "───", _MODEL_DISPLAY_5H_LINE, _MODEL_DISPLAY_WEEKLY_LINE]
+    )
+    assert not any(line.startswith("Model ") for line in result.splitlines())
+
+
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [{}, {"model": None}, {"model": "   "}],
+    ids=["absent", "none", "blank"],
+)
+def test_enabled_model_display_skips_blank_or_missing_model(monkeypatch, model_kwargs):
+    _set_show_model(monkeypatch, True)
+    _stub_codex_usage(monkeypatch)
+
+    result = footer_hook.append_usage_footer("Done.", **model_kwargs)
+
+    assert result == "\n".join(
+        ["Done.", "", "───", _MODEL_DISPLAY_5H_LINE, _MODEL_DISPLAY_WEEKLY_LINE]
+    )
+
+
+def test_enabled_model_display_without_model_or_usage_returns_none(monkeypatch):
+    _set_show_model(monkeypatch, True)
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", _fail_autoreset)
+
+    assert footer_hook.append_usage_footer("Done.", model="   ") is None
+
+
+def test_enabled_model_display_leaves_silence_marker_untouched(monkeypatch):
+    def fail_fetch(_model):
+        pytest.fail("silence markers must skip the usage fetch")
+
+    _set_show_model(monkeypatch, True)
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", fail_fetch)
+
+    assert (
+        footer_hook.append_usage_footer("[SILENT]", model="gpt-5.5-codex") == "[SILENT]"
+    )
+
+
+def test_enabled_model_display_reports_unrecognized_model_alone(monkeypatch):
+    _set_show_model(monkeypatch, True)
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", _fail_autoreset)
+
+    result = footer_hook.append_usage_footer("Done.", model="some-other-model")
+
+    assert result == "Done.\n\n───\nModel some-other-model"
+
+
+def test_enabled_model_display_survives_usage_fetch_failure(monkeypatch, capsys):
+    def _raise(_model):
+        raise RuntimeError("usage fetch exploded")
+
+    _set_show_model(monkeypatch, True)
+    monkeypatch.setattr(footer_hook, "get_usage_for_model", _raise)
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", _fail_autoreset)
+
+    result = footer_hook.append_usage_footer("Done.", model="gpt-5.5-codex")
+
+    assert result == "Done.\n\n───\nModel gpt-5.5-codex"
+    assert "[hermes-usage-hook] skipped:" in capsys.readouterr().err
+
+
+def test_enabled_model_display_survives_summary_render_failure(monkeypatch, capsys):
+    def _raise(_usage):
+        raise RuntimeError("render exploded")
+
+    _set_show_model(monkeypatch, True)
+    _stub_codex_usage(monkeypatch)
+    monkeypatch.setattr(footer_hook, "format_summary", _raise)
+
+    result = footer_hook.append_usage_footer("Done.", model="gpt-5.5-codex")
+
+    assert result == "Done.\n\n───\nModel gpt-5.5-codex"
+    assert "[hermes-usage-hook] skipped:" in capsys.readouterr().err
+
+
+def test_disabled_model_display_leaves_unrecognized_model_reply_unchanged(
+    monkeypatch,
+):
+    _set_show_model(monkeypatch, False)
+    monkeypatch.setattr(footer_hook, "maybe_autoreset", _fail_autoreset)
+
+    assert footer_hook.append_usage_footer("Done.", model="some-other-model") is None
+
+
 def test_manifest_declares_exactly_two_supported_hooks():
     manifest = yaml.safe_load(Path("plugin/plugin.yaml").read_text())
 
@@ -731,6 +930,12 @@ def test_after_install_documents_autoreset_optin():
     ]
     for needle in required:
         assert needle in notice
+
+
+def test_after_install_documents_show_model_optin():
+    notice = Path("plugin/after-install.md").read_text()
+
+    assert "plugins.entries.hermes-usage-hook.footer.show_model" in notice
 
 
 def test_agents_doc_documents_autoreset_internals():

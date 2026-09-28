@@ -40,6 +40,7 @@ Changes can be parked（暫存）— temporarily moved out of `openspec/changes/
 | `plugin/usage.py` | Provider 偵測與 dispatch：把回覆的 `model` 對到 provider、抓 normalized usage、render summary。 |
 | `plugin/autoreset.py` | Codex auto-reset 的設定、門檻政策、最早到期 credit 選擇、state、lock、cooldown、冪等性與一次性 notice。 |
 | `plugin/autoreset_audit.py` | Best-effort 永久 reset 歷史：建構隱私最小化的扁平 event、append（以 hash 過的 event ID 去重）、寬鬆讀回。 |
+| `plugin/footer_config.py` | Footer 顯示設定：從 plugin entry 讀 `footer.show_model`，嚴格布林、型別錯誤 fail closed 加一行 warning。 |
 | `plugin/hermes_home.py` | 用 `hermes_constants.get_hermes_home()` 做 profile-safe 的 Hermes home 解析；該模組不存在時退回 `HERMES_HOME`。 |
 | `plugin/providers/codex_usage.py` | 唯讀讀取 `auth.json`、抓取並正規化 Codex usage、列出 reset credits、POST 一次冪等的 reset-credit 消耗嘗試。 |
 | `plugin/providers/minimax_usage.py` | 解析 MiniMax API token、抓取並正規化 MiniMax usage。 |
@@ -72,13 +73,15 @@ uv run plugin/providers/codex_usage.py
 - `pre_llm_call` — 在打 provider 之前檢查，讓已耗盡的 weekly window 能在 model call 前先 reset。auto reset 關閉時它不打任何 usage / credit API，也不注入 model context，footer 照常運作。
 - `transform_llm_output` — 回覆成功後檢查、reset 後重新抓 usage、附上 footer 與一次性 audit 行。
 
-**Provider dispatch** 在 `usage.py`。每個 fetch 都包起來，失敗只會少掉 footer，不會弄壞回覆。
+**Provider dispatch** 在 `usage.py`。每個 fetch 都包起來，失敗只會少掉 usage 行，不會弄壞回覆；停用 model 顯示時等於整個 footer 被省略，啟用時仍保留 model 行。
 
-**憑證解析。** Codex 走 OAuth，hook 只**讀** access token，不 refresh、不寫回：先看 Hermes 的 `$HERMES_HOME/auth.json`（同時支援 `providers.openai-codex` 與 `credential_pool.openai-codex` 兩種 layout），standalone 則讀 Codex CLI 的 `~/.codex/auth.json`（或 `$CODEX_HOME/auth.json`）。查的是 Codex 工具在用的 ChatGPT 內部非公開 backend API，隨時可能變。Hermes 底下由 Hermes 保持 token 新鮮；token 過期就是 usage call 失敗、footer 被省略。Codex 的 5 小時視窗是**帳號層級**的 rolling quota，不是單一對話的用量，與 Codex CLI 顯示的數字相同。
+**憑證解析。** Codex 走 OAuth，hook 只**讀** access token，不 refresh、不寫回：先看 Hermes 的 `$HERMES_HOME/auth.json`（同時支援 `providers.openai-codex` 與 `credential_pool.openai-codex` 兩種 layout），standalone 則讀 Codex CLI 的 `~/.codex/auth.json`（或 `$CODEX_HOME/auth.json`）。查的是 Codex 工具在用的 ChatGPT 內部非公開 backend API，隨時可能變。Hermes 底下由 Hermes 保持 token 新鮮；token 過期就是 usage call 失敗、usage 行被省略（啟用 model 顯示時 footer 仍保留 model 行）。Codex 的 5 小時視窗是**帳號層級**的 rolling quota，不是單一對話的用量，與 Codex CLI 顯示的數字相同。
 
 `credential_pool` layout 的挑選是**兩層**的：`last_status` 為 `dead`、或缺少非空 `access_token` 的記錄硬性排除（token 已被伺服器端撤銷，降級使用沒有意義）；`last_status` 為 `exhausted` 且 `last_error_reset_at` 仍在未來的記錄只是**降級**，不排除。挑選先在未冷卻的候選裡依 `priority` 昇冪取第一筆，該層為空才在冷卻中的候選裡以同樣規則取。`priority` 缺值、`null`、布林或任何非數值一律正規化為 100 才當排序鍵。`exhausted` 不排除是因為它描述的是 completions endpoint 的帳號配額，而本 plugin 只讀 usage 與 reset-credit 兩個不受該配額限制的端點——把它當排除條件會讓 auto reset 永遠無法觸發，因為 weekly 耗盡正是它唯一的觸發條件。`openai-codex` 的 pool 清單非空卻選不出任何候選時，解析以點名憑證池挑選失敗與記錄筆數的 `RuntimeError` 結束，**不**退回扁平 layout：token 就在檔案裡、只是被規則排除，退回會回報一個與事實相反的「檔案裡沒有可用 token」。清單不存在或為空才維持扁平 layout fallthrough。
 
 MiniMax 是純 API key（沒有 OAuth）：`MINIMAX_API_KEY` 環境變數（空值視為未設）→ `$HERMES_HOME/.env` 裡的 `MINIMAX_API_KEY=<value>` 行（會剝掉外層引號；`HERMES_HOME` 未設時預設 `~/.hermes/.env`）。都拿不到就跳過 MiniMax。MiniMax 沒有 plan tier，所以 `| plan …` 段會省略。
+
+**Footer model 行。** 預設關閉，用 `hermes config set plugins.entries.hermes-usage-hook.footer.show_model true` 啟用。`plugin/footer_config.py` 每次 `transform_llm_output` 呼叫都經 Hermes `load_config()` 重讀，改設定不必重裝或重啟；沒有環境變數覆寫，也不在 `plugin.yaml` 宣告。只有 YAML 布林 `true` 算啟用；缺鍵與 `null` 視同缺席（不 warning，`null` 可用來清除設定）；`show_model` 不是布林、或 `plugins` / `entries` / plugin entry / `footer` 任一層不是 mapping、或 `load_config()` 拋例外，一律 fail closed 並寫一行 `[hermes-usage-hook]` 前綴、點名出錯 key 的 stderr warning。啟用時 footer 分隔線下第一行是 `Model <model>`（`model` kwarg `strip()` 後原樣輸出，空白或缺席就不出這行），接 usage 行，再接一次性 notice。model 不屬於任何 provider、或 usage fetch 失敗（仍寫 `[hermes-usage-hook] skipped:`）時，footer 只剩 model 行，不跑 auto-reset coordinator、不帶 notice。副作用：Hermes 的 `transform_llm_output` 是第一個回傳非空字串的 hook 勝出，啟用後本 plugin 對未知 provider 的回覆也會回傳字串，排在後面的其他 `transform_llm_output` plugin 就不再被呼叫。停用時 footer 與沒有這個功能時逐位元組相同。
 
 **Codex auto reset。** 預設關閉。啟用 `plugins.entries.hermes-usage-hook.auto_reset.enabled` 等於明確授權 plugin 自主消耗 reset credit，而消耗是不可逆的。設定從 plugin entry 讀：
 
