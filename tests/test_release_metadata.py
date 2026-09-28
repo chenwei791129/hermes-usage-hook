@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).parents[1]
 PROJECT_NAME = "hermes-codex-usage-hook"
@@ -39,7 +41,7 @@ def _workspace_package() -> str:
     return workspace_packages[0]
 
 
-def test_release_config_targets_only_anchored_shipped_version() -> None:
+def test_release_config_targets_only_shipped_version() -> None:
     config = json.loads((ROOT / "release-please-config.json").read_text())
     release_manifest = json.loads((ROOT / ".release-please-manifest.json").read_text())
     package = config["packages"]["."]
@@ -51,16 +53,11 @@ def test_release_config_targets_only_anchored_shipped_version() -> None:
         "release-please must target only the shipped plugin/plugin.yaml version"
     )
 
-    manifest_text = (ROOT / "plugin/plugin.yaml").read_text()
-    version_match = re.search(
-        r"^version:\s*(?P<version>[^#\s]+)\s*#\s*x-release-please-version\s*$",
-        manifest_text,
-        re.MULTILINE,
-    )
-    assert version_match is not None, (
-        "plugin/plugin.yaml version must retain its x-release-please-version anchor"
-    )
-    assert version_match.group("version") == release_manifest["."], (
+    # release-please rewrites a .yaml extra-file through its YAML updater, which
+    # re-serializes the document and drops comments, so no anchor comment is
+    # required (or kept) on the version line.
+    manifest = yaml.safe_load((ROOT / "plugin/plugin.yaml").read_text())
+    assert str(manifest["version"]) == release_manifest["."], (
         "plugin/plugin.yaml version must match .release-please-manifest.json"
     )
 
