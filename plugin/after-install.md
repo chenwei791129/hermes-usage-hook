@@ -27,7 +27,8 @@ usage endpoint.
 
 The hook only **reads** the access token — it never refreshes it and never
 writes back, so under Hermes it relies on Hermes keeping the token fresh. An
-expired token means the usage call fails and the footer is omitted.
+expired token means the usage call fails and the usage lines are omitted; with
+the model display from section 5 enabled, the `Model` line still remains.
 
 ## 3. MiniMax usage needs `MINIMAX_API_KEY`
 
@@ -57,6 +58,34 @@ hermes config set plugins.entries.hermes-usage-hook.auto_reset.threshold 1
 `threshold` uses weekly-remaining semantics and accepts explicit values `1..99`. Explicit `0` fails closed and emits a warning; if Hermes has already frozen the Codex credential as `exhausted`, use `/usage reset` to recover it manually. Once auto reset
 is on, `/usagehook history [N]` reports past resets from any chat platform (`N`
 is 1–100, newest 5 by default).
+
+## 5. Footer model line is disabled by default
+
+The footer can also show which model answered the reply. The line is off unless
+you turn it on:
+
+```bash
+hermes config set plugins.entries.hermes-usage-hook.footer.show_model true
+```
+
+Set it back to `false` (or `null`) to turn it off. Only the YAML boolean `true`
+enables it; any other value is treated as off and logs one
+`[hermes-usage-hook]` warning. The setting is re-read on every reply, so no
+reinstall or restart is needed. When enabled, the model line sits above the
+usage lines:
+
+```text
+───
+Model gpt-5.5-codex
+Codex 5h | used 42%, left 58% (resets in 2h17m) | plan pro
+Codex weekly | used 10%, left 90% (resets in 6d4h)
+```
+
+With it enabled, a reply from a model this plugin has no usage provider for —
+or one whose usage fetch fails — still gets a footer carrying only the `Model`
+line. Because Hermes stops at the first `transform_llm_output` hook that returns
+text, any other `transform_llm_output` plugin ordered after this one is then no
+longer called for those replies either.
 
 ## Streaming caveat
 
