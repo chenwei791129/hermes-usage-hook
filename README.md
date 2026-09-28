@@ -1,5 +1,7 @@
 # Hermes Usage Hook
 
+[![release-please](https://github.com/chenwei791129/hermes-usage-hook/actions/workflows/release-please.yml/badge.svg?branch=main)](https://github.com/chenwei791129/hermes-usage-hook/actions/workflows/release-please.yml)
+
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that
 appends your **LLM provider's rate-limit usage** to the end of every reply.
 
