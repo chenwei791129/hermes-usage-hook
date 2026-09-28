@@ -86,14 +86,27 @@ metadata and all — into your plugins directory. Nothing visibly fails, because
 Hermes treats a manifest-less install directory as a namespace and finds the
 nested `plugin/plugin.yaml` one level down; you simply end up with a repo
 checkout where a plugin should be. Remove it and reinstall with the
-subdirectory.
+subdirectory. (Observed on Hermes 0.19.0; automatic detection of the plugin
+subdirectory is proposed upstream in
+[PR #65337](https://github.com/NousResearch/hermes-agent/pull/65337), still
+unmerged; once it lands, this warning is obsolete.)
 
-Either way the installed directory contains no `.git`, so `hermes plugins
-update` and the dashboard's update action report the plugin as not updatable —
-upgrading means removing and installing again. Upstream tracks this in
-[issue #65314](https://github.com/NousResearch/hermes-agent/issues/65314) and
-[PR #65337](https://github.com/NousResearch/hermes-agent/pull/65337). The
-`install.py` path is equally `.git`-less, but re-running it upgrades in place.
+This path installs the default branch's latest commit, not the latest release,
+and the installed directory contains no `.git`. Updating depends on your
+Hermes version:
+
+- **Hermes v0.21.5 or later** — `hermes plugins update` and the dashboard's
+  update action re-install the plugin from its recorded source, per the fix for
+  [issue #65314](https://github.com/NousResearch/hermes-agent/issues/65314) in
+  [PR #118838](https://github.com/NousResearch/hermes-agent/pull/118838). Pinned
+  installs are still refused. This is taken from the upstream fix and has not
+  been verified against this plugin.
+- **Older Hermes** — the plugin is reported as not updatable; upgrading means
+  removing and installing again.
+
+A whole-repository install (identifier without `/plugin`) is not covered by
+that fix; remove and reinstall it with the subdirectory. The `install.py` path
+is equally `.git`-less, but re-running it upgrades in place.
 
 ## After installing
 
