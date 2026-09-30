@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.5.0...v0.6.0) (2026-09-30)
+
+
+### Features
+
+* optionally show the serving model in the footer ([d50ebf4](https://github.com/chenwei791129/hermes-usage-hook/commit/d50ebf4c7c42349665fc0a121e5997573b74535b))
+
+
+### Bug Fixes
+
+* **release:** drop anchor requirement from plugin manifest version check ([f4975ca](https://github.com/chenwei791129/hermes-usage-hook/commit/f4975cab1a15e7bbd6c89d5f22980b5633a157a8))
+
 ## [0.5.0](https://github.com/chenwei791129/hermes-usage-hook/compare/v0.4.0...v0.5.0) (2026-09-04)
 
 
