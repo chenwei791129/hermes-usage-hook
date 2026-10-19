@@ -18,9 +18,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Shared workflow: the pinned release-please SHA is maintained in
+  # chenwei791129/.github for every repository. release-type is omitted so the
+  # repository's release-please-config.json / .release-please-manifest.json
+  # (default names) are used.
   release-please:
-    runs-on: ubuntu-26.04
-    steps:
-      # config-file / manifest-file omitted: the files use release-please's
-      # default names (release-please-config.json, .release-please-manifest.json).
-      - uses: googleapis/release-please-action@v5
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: chenwei791129/.github/.github/workflows/release-please.yml@main
