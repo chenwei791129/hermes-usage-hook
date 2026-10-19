@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   release-please:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       # config-file / manifest-file omitted: the files use release-please's
       # default names (release-please-config.json, .release-please-manifest.json).
