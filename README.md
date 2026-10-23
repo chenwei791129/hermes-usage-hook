@@ -83,32 +83,32 @@ chenwei791129/hermes-usage-hook/plugin
 `https://github.com/chenwei791129/hermes-usage-hook/tree/main/plugin` and
 `https://github.com/chenwei791129/hermes-usage-hook.git#plugin` are equivalent.
 
-Omit `/plugin` and Hermes copies the **whole repository** — tests, specs, git
-metadata and all — into your plugins directory. Nothing visibly fails, because
-Hermes treats a manifest-less install directory as a namespace and finds the
-nested `plugin/plugin.yaml` one level down; you simply end up with a repo
-checkout where a plugin should be. Remove it and reinstall with the
-subdirectory. (Observed on Hermes 0.19.0; automatic detection of the plugin
-subdirectory is proposed upstream in
-[PR #65337](https://github.com/NousResearch/hermes-agent/pull/65337), still
-unmerged; once it lands, this warning is obsolete.)
+Always include `/plugin`: Hermes does not automatically select the plugin
+subdirectory. Omitting it installs the **whole repository**, including tests
+and specs. If you previously installed without the subdirectory, remove that
+installation and reinstall with the identifier above.
 
-This path installs the default branch's latest commit, not the latest release,
-and the installed directory contains no `.git`. Updating depends on your
-Hermes version:
+This path installs the default branch's latest commit, not the latest release.
+The branch segment in a GitHub `tree` URL is ignored; use the installer above
+when you need a release tag or branch.
 
-- **Hermes v0.21.5 or later** — `hermes plugins update` and the dashboard's
-  update action re-install the plugin from its recorded source, per the fix for
-  [issue #65314](https://github.com/NousResearch/hermes-agent/issues/65314) in
-  [PR #118838](https://github.com/NousResearch/hermes-agent/pull/118838). Pinned
-  installs are still refused. This is taken from the upstream fix and has not
-  been verified against this plugin.
-- **Older Hermes** — the plugin is reported as not updatable; upgrading means
-  removing and installing again.
+Update a Hermes-managed installation with:
 
-A whole-repository install (identifier without `/plugin`) is not covered by
-that fix; remove and reinstall it with the subdirectory. The `install.py` path
-is equally `.git`-less, but re-running it upgrades in place.
+```bash
+hermes plugins update hermes-usage-hook
+```
+
+The dashboard's update action works too. Hermes updates subdirectory installs
+from their recorded source; no Git checkout is required in the installed
+plugin directory. This behavior is confirmed in the Hermes v0.22.5 source and
+upstream regression tests, but has not been tested end-to-end with this plugin.
+
+Custom-source installs pinned with Hermes's `--ref` do not follow updates;
+changing the pin requires an explicit reinstall. Unlike this repo's
+`install.py --ref`, Hermes's `--ref` accepts only a full commit SHA, not a
+branch or tag. Catalog-managed pins have a separate reviewed-update workflow.
+
+If you installed with `install.py`, update by re-running that installer.
 
 ## After installing
 
